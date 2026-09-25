@@ -18,8 +18,9 @@ spec:
           expr: DCGM_FI_DEV_GPU_UTIL * 100
           labels:
             vendor: nvidia
+        # DCGM_FI_DEV_FB_USED is framebuffer used in MiB; metric name is bytes.
         - record: accelerator_memory_used_bytes
-          expr: DCGM_FI_DEV_FB_USED
+          expr: DCGM_FI_DEV_FB_USED * 1024 * 1024
           labels:
             vendor: nvidia
         - record: accelerator_temperature_celsius
