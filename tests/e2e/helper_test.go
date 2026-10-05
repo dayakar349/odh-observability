@@ -46,6 +46,13 @@ const (
 	LokiStackName                     = "data-science-lokistack"
 )
 
+func cooOperatorChannel() string {
+	if testOpts.cooChannel != "" {
+		return testOpts.cooChannel
+	}
+	return observabilityOpChannel
+}
+
 // OLM operator constants for dependent operators.
 const (
 	observabilityOpName      = "cluster-observability-operator"
@@ -839,7 +846,7 @@ func (tc *MonitoringTestCtx) installDependentOperators(t *testing.T) {
 	}
 
 	operators := []operator{
-		{observabilityOpNamespace, observabilityOpName, observabilityOpChannel},
+		{observabilityOpNamespace, observabilityOpName, cooOperatorChannel()},
 		{tempoOpNamespace, tempoOpName, tempoOpChannel},
 		{opentelemetryOpNamespace, opentelemetryOpName, opentelemetryOpChannel},
 		{certManagerOpNamespace, certManagerOpName, certManagerOpChannel},
