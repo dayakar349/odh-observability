@@ -165,6 +165,29 @@ func (tc *TestContext) monitoringOwnerReferencesCondition() gTypes.GomegaMatcher
 	)
 }
 
+// jsonCompatibleValue converts values produced by gojq (e.g. int) into types
+// accepted by unstructured.SetNestedField / runtime.DeepCopyJSON.
+func jsonCompatibleValue(v any) any {
+	switch x := v.(type) {
+	case int:
+		return int64(x)
+	case int32:
+		return int64(x)
+	case map[string]any:
+		for k, val := range x {
+			x[k] = jsonCompatibleValue(val)
+		}
+		return x
+	case []any:
+		for i, val := range x {
+			x[i] = jsonCompatibleValue(val)
+		}
+		return x
+	default:
+		return v
+	}
+}
+
 // rebaseForDSCI wraps transforms so they operate on DSCI's .spec.monitoring
 // as if it were .spec on a Monitoring CR. This lets every existing transform
 // function work unchanged in DSC mode.
@@ -334,10 +357,14 @@ func (tc *MonitoringTestCtx) setupMetrics(t *testing.T) {
 	if !metricsPresent {
 		tc.waitForPrometheusPodsGone(t)
 	}
-	tc.updateMonitoringConfig(
+	transforms := []jq.TransformFn{
 		withManagementState(common.Managed),
 		tc.withMetricsConfig(),
-	)
+	}
+	if tc.expectedDefaultReplicas > 0 {
+		transforms = append(transforms, withMetricsReplicas(tc.expectedDefaultReplicas))
+	}
+	tc.updateMonitoringConfig(transforms...)
 	tc.waitForPrometheusReady(t)
 }
 
@@ -729,7 +756,9 @@ func (tc *TestContext) withMetricsConfig() jq.TransformFn {
 }
 
 func withMetricsReplicas(replicas int) jq.TransformFn {
-	return jq.Transform(`.spec.metrics.replicas = %d`, replicas)
+	return func(u *unstructured.Unstructured) error {
+		return unstructured.SetNestedField(u.Object, int64(replicas), "spec", "metrics", "replicas")
+	}
 }
 
 func withNamespace(namespace string) jq.TransformFn {

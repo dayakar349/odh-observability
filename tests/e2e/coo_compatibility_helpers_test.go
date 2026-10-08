@@ -14,6 +14,8 @@ func TestIsUnsupportedPersesTLSArg(t *testing.T) {
 	}{
 		{arg: "--web.tls.cert=/tmp/tls.crt", want: true},
 		{arg: "--web.enable-tls", want: true},
+		{arg: "--web.tls-min-version=1.2", want: false},
+		{arg: "--web.tls-cipher-suites=TLS_AES_128_GCM_SHA256", want: false},
 		{arg: "--config=/etc/perses/config.yaml", want: false},
 		{arg: "--log.level=info", want: false},
 	}
@@ -101,6 +103,9 @@ func TestValidatePersesHealthResponse(t *testing.T) {
 	if err := validatePersesHealthResponse(`{"buildTime":"x","commit":"y","database":false}`); err == nil {
 		t.Fatal("expected missing version to fail")
 	}
+	if err := validatePersesHealthResponse(`{"database":true}`); err != nil {
+		t.Fatalf("expected database=true to pass: %v", err)
+	}
 	if err := validatePersesHealthResponse("ok"); err == nil {
 		t.Fatal("expected plain text to fail")
 	}
@@ -114,6 +119,45 @@ func TestPersesContainerFromPodSpec(t *testing.T) {
 	name, image, args, found := persesContainerFromPodSpec(containers)
 	if !found || name != "perses" || !strings.Contains(image, "perses") || len(args) != 1 {
 		t.Fatalf("unexpected result: found=%v name=%q image=%q args=%v", found, name, image, args)
+	}
+}
+
+func TestValidatePrometheusInstantQueryResponse(t *testing.T) {
+	valid := `{"status":"success","data":{"resultType":"vector","result":[]}}`
+	if err := validatePrometheusInstantQueryResponse(valid); err != nil {
+		t.Fatalf("expected valid query response: %v", err)
+	}
+	if err := validatePrometheusInstantQueryResponse(`{"status":"error","error":"bad"}`); err == nil {
+		t.Fatal("expected error status to fail")
+	}
+}
+
+func TestValidatePersesProjectsResponse(t *testing.T) {
+	if err := validatePersesProjectsResponse(`[]`); err != nil {
+		t.Fatalf("expected empty project list: %v", err)
+	}
+	if err := validatePersesProjectsResponse(`{"kind":"ProjectList","items":[]}`); err != nil {
+		t.Fatalf("expected project list object: %v", err)
+	}
+	if err := validatePersesProjectsResponse("not-json"); err == nil {
+		t.Fatal("expected invalid JSON to fail")
+	}
+}
+
+func TestKubernetesServiceProxyURLWithQuery(t *testing.T) {
+	got, err := kubernetesServiceProxyURL(
+		"https://api.example.com:6443",
+		"redhat-ods-monitoring",
+		"data-science-prometheus-namespace-proxy",
+		8443,
+		"/api/v1/query?query=up",
+		true,
+	)
+	if err != nil {
+		t.Fatalf("kubernetesServiceProxyURL: %v", err)
+	}
+	if !strings.Contains(got, "query=up") {
+		t.Fatalf("expected query string in proxy URL, got %q", got)
 	}
 }
 
@@ -191,17 +235,17 @@ func TestReleaseGateCOOCSVVersions(t *testing.T) {
 
 func TestReleaseGateRHOAICSVVersions(t *testing.T) {
 	for _, csv := range []string{
-		"rhods-operator.v3.6.0",
-		"rhods-operator.v3.6.1",
+		"rhods-operator.3.6.0",
+		"rhods-operator.3.6.1",
 	} {
 		if !releaseGateRHOAICSVMatches(csv) {
 			t.Fatalf("expected %q to match RHOAI 3.6 release gate", csv)
 		}
 	}
 	for _, csv := range []string{
-		"rhods-operator.v3.7.0",
-		"rhods-operator.v3.60.0",
-		"rhods-operator.v3.5.9",
+		"rhods-operator.3.7.0",
+		"rhods-operator.3.60.0",
+		"rhods-operator.3.5.9",
 	} {
 		if releaseGateRHOAICSVMatches(csv) {
 			t.Fatalf("expected %q to be rejected by RHOAI 3.6 release gate", csv)
