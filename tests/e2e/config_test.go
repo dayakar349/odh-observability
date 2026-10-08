@@ -211,9 +211,9 @@ var releaseGateContract = struct {
 	COOCSVPrefix   string
 	PersesImage    string
 }{
-	RHOAICSVPrefix: "rhods-operator.v3.6",
+	RHOAICSVPrefix: "rhods-operator.3.6",
 	COOCSVPrefix:   "cluster-observability-operator.v1.5",
-	PersesImage:    "registry.redhat.io/cluster-observability-operator/perses-rhel9@sha256:27553fd6d4b4983475a0d9a4ccc7d7fa63b1bd4b48f0e5cb2d18963fe232cfd5",
+	PersesImage:    "registry.redhat.io/cluster-observability-operator/perses-rhel9@sha256:a811b9345d884ba1c575584bec9be1d2a237902164a99887458a82d07e7c2376",
 }
 
 var cooCompatibilityGateSubtests = []string{

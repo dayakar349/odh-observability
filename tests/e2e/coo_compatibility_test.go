@@ -2,14 +2,14 @@ package e2e_test
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
+	"os/exec"
 	"regexp"
 	"slices"
 	"strings"
@@ -19,6 +19,7 @@ import (
 	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -41,11 +42,14 @@ const (
 	persesServicePort                 = 8080
 	prometheusNamespaceProxyService   = "data-science-prometheus-namespace-proxy"
 	prometheusNamespaceProxyPort      = 8443
+	prometheusDashboardRouteName      = "data-science-prometheus-route"
+	cooCompatibilityPromQLQuery       = "up"
 	maxCompatibilityHTTPResponseBytes = 1 << 20 // 1 MiB
 	compatibilityHTTPRequestTimeout   = 2 * time.Minute
 )
 
-var rhoaiOperatorSubscriptionNames = []string{"rhods-operator", "odh-observability-operator"}
+// rhoai-operator-dev is the olminstall dev-catalog subscription name (package rhods-operator).
+var rhoaiOperatorSubscriptionNames = []string{"rhods-operator", "rhoai-operator-dev", "odh-observability-operator"}
 
 var (
 	clusterVersionGVK = schema.GroupVersionKind{Group: "config.openshift.io", Version: "v1", Kind: "ClusterVersion"}
@@ -64,9 +68,22 @@ type cooCompatibilityReport struct {
 	MonitoringConditions    map[string]string `json:"monitoringConditions,omitempty"`
 	DashboardProbe          string            `json:"dashboardProbe,omitempty"`
 	PersesProbe             string            `json:"persesProbe,omitempty"`
+	PersesProjectsProbe     string            `json:"persesProjectsProbe,omitempty"`
+	PrometheusQueryProbe    string            `json:"prometheusQueryProbe,omitempty"`
+	PrometheusRouteHost     string            `json:"prometheusRouteHost,omitempty"`
 	PersesLogDiagnostic     string            `json:"persesLogDiagnostic,omitempty"`
 	CompatibilityNotes      []string          `json:"compatibilityNotes,omitempty"`
 	FailedAssertion         string            `json:"failedAssertion,omitempty"`
+}
+
+func failCompatibilityGate(t *testing.T, report *cooCompatibilityReport, assertion string, err error) {
+	t.Helper()
+	if err != nil {
+		report.FailedAssertion = fmt.Sprintf("%s: %v", assertion, err)
+		t.Fatalf("%s: %v", assertion, err)
+	}
+	report.FailedAssertion = assertion
+	t.Fatal(assertion)
 }
 
 func cooVersionCompatibilitySuite(t *testing.T) {
@@ -75,10 +92,15 @@ func cooVersionCompatibilitySuite(t *testing.T) {
 	tc, err := NewTestContext(t)
 	require.NoError(t, err)
 
-	mctx := MonitoringTestCtx{TestContext: tc}
+	mctx := MonitoringTestCtx{
+		TestContext:             tc,
+		expectedDefaultReplicas: detectExpectedReplicas(t, tc),
+	}
 	report := &cooCompatibilityReport{}
 
-	t.Cleanup(func() {
+	// defer (not t.Cleanup) so diagnostics are captured before registerMonitoringRestore's
+	// t.Cleanup runs in LIFO order and reverts Monitoring/DSCI.
+	defer func() {
 		if t.Failed() {
 			mctx.enrichCompatibilityReport(t, report)
 			payload, err := json.MarshalIndent(report, "", "  ")
@@ -93,16 +115,12 @@ func cooVersionCompatibilitySuite(t *testing.T) {
 					t.Logf("failed to resolve compatibility report path: %v", err)
 					return
 				}
-				if err := os.MkdirAll(filepath.Dir(resolved), 0o750); err != nil {
-					t.Logf("failed to create compatibility report directory: %v", err)
-					return
-				}
 				if writeErr := writeCompatibilityReportFile(resolved, payload); writeErr != nil {
 					t.Logf("failed to write compatibility report to %s: %v", resolved, writeErr)
 				}
 			}
 		}
-	})
+	}()
 
 	mctx.ensurePrerequisites(t)
 	mctx.setupMetrics(t)
@@ -126,9 +144,11 @@ func (tc *MonitoringTestCtx) validateCOOVersionInstalled(t *testing.T, report *c
 	tc = tc.WithT(t)
 
 	csvName, version, err := tc.clusterObservabilityCSV()
-	require.NoError(t, err, "failed to read Cluster Observability Operator CSV")
 	report.ClusterObservabilityCSV = csvName
 	report.ClusterObservabilityVer = version
+	if err != nil {
+		failCompatibilityGate(t, report, "failed to read Cluster Observability Operator CSV", err)
+	}
 
 	if !releaseGateCOOCSVMatches(csvName) {
 		report.FailedAssertion = fmt.Sprintf("COO CSV %q does not match required prefix %q", csvName, releaseGateContract.COOCSVPrefix)
@@ -136,13 +156,17 @@ func (tc *MonitoringTestCtx) validateCOOVersionInstalled(t *testing.T, report *c
 	}
 
 	openshiftVersion, err := tc.openShiftVersion()
-	require.NoError(t, err, "failed to read OpenShift cluster version")
+	if err != nil {
+		failCompatibilityGate(t, report, "failed to read OpenShift cluster version", err)
+	}
 	report.OpenShiftVersion = openshiftVersion
 
 	odhCSV, odhVersion, err := tc.odhObservabilityOperatorCSV()
-	require.NoError(t, err, "failed to read installed RHOAI/odh-observability operator CSV")
 	report.OdhObservabilityCSV = odhCSV
 	report.OdhObservabilityVer = odhVersion
+	if err != nil {
+		failCompatibilityGate(t, report, "failed to read installed RHOAI/odh-observability operator CSV", err)
+	}
 
 	if !releaseGateRHOAICSVMatches(odhCSV) {
 		report.FailedAssertion = fmt.Sprintf("RHOAI operator CSV %q does not match required prefix %q", odhCSV, releaseGateContract.RHOAICSVPrefix)
@@ -237,8 +261,18 @@ func (tc *MonitoringTestCtx) validateDashboardProxyAPIs(t *testing.T, report *co
 
 	tc.validatePrometheusNamespaceProxyResourcesCommon(t)
 
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Route, types.NamespacedName{Name: prometheusDashboardRouteName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(jq.Match(`((.status.ingress[0].host // .spec.host) // "") != ""`)),
+		WithCustomErrorMsg("Prometheus dashboard Route should expose a user-visible host"),
+	)
+	route := tc.FetchResource(WithMinimalObject(gvk.Route, types.NamespacedName{Name: prometheusDashboardRouteName, Namespace: tc.MonitoringNamespace}))
+	report.PrometheusRouteHost = prometheusDashboardRouteHost(route)
+
 	persesBody, persesStatus, err := tc.kubernetesServiceGET(tc.MonitoringNamespace, PersesName, persesServicePort, "/api/v1/health", false)
-	require.NoError(t, err, "Perses health request failed")
+	if err != nil {
+		failCompatibilityGate(t, report, "Perses health request failed", err)
+	}
 	report.PersesProbe = fmt.Sprintf("HTTP %d", persesStatus)
 	if persesStatus < 200 || persesStatus >= 300 {
 		report.FailedAssertion = fmt.Sprintf("Perses health returned HTTP %d", persesStatus)
@@ -253,41 +287,69 @@ func (tc *MonitoringTestCtx) validateDashboardProxyAPIs(t *testing.T, report *co
 		t.Fatalf("%s: %v", report.FailedAssertion, err)
 	}
 
-	promBody, promStatus, err := tc.kubernetesServiceGET(
-		tc.MonitoringNamespace,
-		prometheusNamespaceProxyService,
-		prometheusNamespaceProxyPort,
-		"/api/v1/status/buildinfo",
-		true,
-	)
-	require.NoError(t, err, "Prometheus namespace proxy request failed")
+	projectsBody, projectsStatus, err := tc.kubernetesServiceGET(tc.MonitoringNamespace, PersesName, persesServicePort, "/api/v1/projects", false)
+	if err != nil {
+		failCompatibilityGate(t, report, "Perses projects API request failed", err)
+	}
+	report.PersesProjectsProbe = fmt.Sprintf("HTTP %d /api/v1/projects", projectsStatus)
+	if projectsStatus < 200 || projectsStatus >= 300 {
+		report.FailedAssertion = fmt.Sprintf("Perses projects API returned HTTP %d", projectsStatus)
+		t.Fatalf("%s", report.FailedAssertion)
+	}
+	if err := validatePersesProjectsResponse(projectsBody); err != nil {
+		report.FailedAssertion = "Perses projects API did not return a valid Perses API response"
+		t.Fatalf("%s: %v", report.FailedAssertion, err)
+	}
+
+	// Namespace proxy kube-rbac-proxy authorizes metrics.k8s.io/pods; requests must include namespace=.
+	// Use the dashboard Route (not the API server service proxy): HTTPS backends do not receive the
+	// caller bearer token through /services/proxy, so in-cluster SAR checks would always fail.
+	promQueryPath := prometheusNamespaceProxyQueryPath(cooCompatibilityPromQLQuery, tc.MonitoringNamespace)
+	queryBody, queryStatus, err := tc.prometheusDashboardRouteGET(report.PrometheusRouteHost, promQueryPath)
+	if err != nil {
+		failCompatibilityGate(t, report, "Prometheus dashboard proxy PromQL request failed", err)
+	}
 	report.DashboardProbe = fmt.Sprintf(
-		"service %s:%d /api/v1/status/buildinfo HTTP %d",
-		prometheusNamespaceProxyService, prometheusNamespaceProxyPort, promStatus,
+		"route %s %s HTTP %d",
+		report.PrometheusRouteHost, promQueryPath, queryStatus,
 	)
-	if promStatus < 200 || promStatus >= 300 {
-		report.FailedAssertion = fmt.Sprintf("Prometheus dashboard proxy returned HTTP %d", promStatus)
+	report.PrometheusQueryProbe = report.DashboardProbe
+	if queryStatus < 200 || queryStatus >= 300 {
+		report.FailedAssertion = fmt.Sprintf("Prometheus PromQL query returned HTTP %d", queryStatus)
 		t.Fatalf("%s", report.FailedAssertion)
 	}
-	if looksLikeHTMLResponse(promBody) {
-		report.FailedAssertion = "Prometheus dashboard proxy returned HTML instead of an API payload"
+	if looksLikeHTMLResponse(queryBody) {
+		report.FailedAssertion = "Prometheus PromQL query returned HTML instead of an API payload"
 		t.Fatalf("%s", report.FailedAssertion)
 	}
-	if err := validatePrometheusBuildInfoResponse(promBody); err != nil {
-		report.FailedAssertion = "Prometheus dashboard proxy did not return a valid Prometheus API response"
+	if err := validatePrometheusInstantQueryResponse(queryBody); err != nil {
+		report.FailedAssertion = "Prometheus dashboard proxy did not return a valid PromQL API response"
 		t.Fatalf("%s: %v", report.FailedAssertion, err)
 	}
 
 	uiPluginCRDAvailable, err := tc.optionalCRDAvailable(uiPluginGVK)
-	require.NoError(t, err, "failed to determine whether Dashboards UIPlugin CRD is available")
-	if uiPluginCRDAvailable {
-		tc.EnsureResourceExists(
-			WithMinimalObject(uiPluginGVK, types.NamespacedName{Name: "dashboards"}),
-			WithCondition(jq.Match(`[.status.conditions[]? | select(.type == "Ready" or .type == "Available") | .status] | any(. == "True")`)),
-			WithEventuallyTimeout(10*time.Minute),
-			WithCustomErrorMsg("Dashboards UIPlugin should report Ready when CRD is installed"),
-		)
+	if err != nil {
+		failCompatibilityGate(t, report, "failed to determine whether Dashboards UIPlugin CRD is available", err)
 	}
+	if !uiPluginCRDAvailable {
+		report.CompatibilityNotes = append(report.CompatibilityNotes, "Dashboards UIPlugin CRD is not installed on this cluster")
+		return
+	}
+	_, err = tc.fetchResource(tc.t, uiPluginGVK, types.NamespacedName{Name: "dashboards"})
+	if err != nil {
+		if k8serr.IsNotFound(err) {
+			report.CompatibilityNotes = append(report.CompatibilityNotes,
+				"Dashboards UIPlugin CRD is installed but dashboards UIPlugin instance is not present on this cluster")
+			return
+		}
+		failCompatibilityGate(t, report, "failed to read Dashboards UIPlugin", err)
+	}
+	tc.EnsureResourceExists(
+		WithMinimalObject(uiPluginGVK, types.NamespacedName{Name: "dashboards"}),
+		WithCondition(jq.Match(`[.status.conditions[]? | select(.type == "Ready" or .type == "Available") | .status] | any(. == "True")`)),
+		WithEventuallyTimeout(10*time.Minute),
+		WithCustomErrorMsg("Dashboards UIPlugin should report Ready when installed"),
+	)
 }
 
 func (tc *MonitoringTestCtx) enrichCompatibilityReport(t *testing.T, report *cooCompatibilityReport) {
@@ -370,21 +432,13 @@ func (tc *MonitoringTestCtx) enrichDashboardProbeSnapshot(report *cooCompatibili
 			report.PersesProbe = fmt.Sprintf("HTTP %d", status)
 		}
 	}
-	if report.DashboardProbe == "" {
-		_, status, err := tc.kubernetesServiceGET(
-			tc.MonitoringNamespace,
-			prometheusNamespaceProxyService,
-			prometheusNamespaceProxyPort,
-			"/api/v1/status/buildinfo",
-			true,
-		)
+	if report.DashboardProbe == "" && report.PrometheusRouteHost != "" {
+		path := prometheusNamespaceProxyQueryPath(cooCompatibilityPromQLQuery, tc.MonitoringNamespace)
+		_, status, err := tc.prometheusDashboardRouteGET(report.PrometheusRouteHost, path)
 		if err != nil {
 			report.CompatibilityNotes = append(report.CompatibilityNotes, "Prometheus probe: "+err.Error())
 		} else {
-			report.DashboardProbe = fmt.Sprintf(
-				"service %s:%d /api/v1/status/buildinfo HTTP %d",
-				prometheusNamespaceProxyService, prometheusNamespaceProxyPort, status,
-			)
+			report.DashboardProbe = fmt.Sprintf("route %s %s HTTP %d", report.PrometheusRouteHost, path, status)
 		}
 	}
 }
@@ -466,7 +520,7 @@ func (tc *MonitoringTestCtx) odhObservabilityOperatorCSV() (string, string, erro
 		}
 	}
 	if len(candidates) == 0 {
-		return "", "", errors.New("odh-observability operator subscription not found")
+		return "", "", errors.New("RHOAI operator subscription not found (expected OLM subscription for rhods-operator, e.g. rhods-operator or rhoai-operator-dev)")
 	}
 	if len(candidates) == 1 {
 		return candidates[0].csvName, candidates[0].version, nil
@@ -592,6 +646,27 @@ func validatePrometheusBuildInfoResponse(body string) error {
 	return nil
 }
 
+type prometheusInstantQueryResponse struct {
+	Status string `json:"status"`
+	Data   struct {
+		ResultType string `json:"resultType"`
+	} `json:"data"`
+}
+
+func validatePrometheusInstantQueryResponse(body string) error {
+	var response prometheusInstantQueryResponse
+	if err := json.Unmarshal([]byte(body), &response); err != nil {
+		return err
+	}
+	if response.Status != "success" {
+		return fmt.Errorf("status is %q", response.Status)
+	}
+	if response.Data.ResultType == "" {
+		return errors.New("data.resultType is empty")
+	}
+	return nil
+}
+
 type persesHealthResponse struct {
 	BuildTime string `json:"buildTime"`
 	Version   string `json:"version"`
@@ -607,10 +682,50 @@ func validatePersesHealthResponse(body string) error {
 	if err := json.Unmarshal([]byte(body), &response); err != nil {
 		return err
 	}
-	if response.Version == "" {
-		return errors.New("version is empty")
+	if response.Version != "" {
+		return nil
 	}
-	return nil
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(body), &raw); err != nil {
+		return err
+	}
+	if persesHealthVersionFromMap(raw) != "" {
+		return nil
+	}
+	if db, ok := raw["database"].(bool); ok && db {
+		return nil
+	}
+	return errors.New("version is empty")
+}
+
+func persesHealthVersionFromMap(raw map[string]any) string {
+	if v, ok := raw["version"].(string); ok && v != "" {
+		return v
+	}
+	meta, ok := raw["metadata"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	if v, ok := meta["version"].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func validatePersesProjectsResponse(body string) error {
+	if strings.TrimSpace(body) == "" {
+		return errors.New("empty response body")
+	}
+	var decoded any
+	if err := json.Unmarshal([]byte(body), &decoded); err != nil {
+		return err
+	}
+	switch decoded.(type) {
+	case []any, map[string]any:
+		return nil
+	default:
+		return errors.New("unexpected Perses projects payload type")
+	}
 }
 
 func persesContainerFromPodSpec(containers []any) (string, string, []string, bool) {
@@ -738,9 +853,11 @@ func (tc *MonitoringTestCtx) podLogTail(nn types.NamespacedName, container strin
 }
 
 func isUnsupportedPersesTLSArg(arg string) bool {
-	lower := strings.ToLower(arg)
+	lower := strings.ToLower(strings.TrimSpace(arg))
 	unsupported := []string{
-		"--web.tls",
+		"--web.tls.cert",
+		"--web.tls.key",
+		"--web.tls.ca",
 		"--tls.server",
 		"--web.enable-tls",
 	}
@@ -748,6 +865,9 @@ func isUnsupportedPersesTLSArg(arg string) bool {
 		if strings.HasPrefix(lower, prefix) {
 			return true
 		}
+	}
+	if lower == "--web.tls" || strings.HasPrefix(lower, "--web.tls=") {
+		return true
 	}
 	return false
 }
@@ -778,6 +898,81 @@ func truncateForLog(body string, limit int) string {
 		return body
 	}
 	return body[:limit] + "..."
+}
+
+func prometheusNamespaceProxyQueryPath(promQL, namespace string) string {
+	return "/api/v1/query?query=" + url.QueryEscape(promQL) + "&namespace=" + url.QueryEscape(namespace)
+}
+
+func prometheusDashboardRouteHost(route *unstructured.Unstructured) string {
+	host, _, _ := unstructured.NestedString(route.Object, "status", "ingress", "0", "host")
+	if host != "" {
+		return host
+	}
+	host, _, _ = unstructured.NestedString(route.Object, "spec", "host")
+	return host
+}
+
+func (tc *MonitoringTestCtx) prometheusDashboardRouteGET(routeHost, path string) (string, int, error) {
+	if routeHost == "" {
+		return "", 0, errors.New("prometheus dashboard route host is empty")
+	}
+	if err := validateKubernetesProxyPath(path); err != nil {
+		return "", 0, err
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	requestURL := "https://" + routeHost + path
+	token, err := tc.kubernetesBearerToken()
+	if err != nil {
+		return "", 0, err
+	}
+	httpClient := &http.Client{
+		Timeout: compatibilityHTTPRequestTimeout,
+		Transport: &http.Transport{
+			//nolint:gosec // G402: e2e hits the cluster ingress Route; client uses kube bearer token, not a pinned route CA.
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	ctx, cancel := context.WithTimeout(tc.Context(), compatibilityHTTPRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	body, err := readLimitedHTTPBody(resp.Body)
+	if err != nil {
+		return "", resp.StatusCode, err
+	}
+	return string(body), resp.StatusCode, nil
+}
+
+func (tc *MonitoringTestCtx) kubernetesBearerToken() (string, error) {
+	if token := strings.TrimSpace(tc.AuthToken()); token != "" {
+		return token, nil
+	}
+	cfg, err := ctrlcfg.GetConfig()
+	if err != nil {
+		return "", err
+	}
+	if token := strings.TrimSpace(cfg.BearerToken); token != "" {
+		return token, nil
+	}
+	out, err := exec.CommandContext(tc.Context(), "oc", "whoami", "-t").Output()
+	if err != nil {
+		return "", fmt.Errorf("no Kubernetes bearer token in kubeconfig and oc whoami -t failed: %w", err)
+	}
+	if token := strings.TrimSpace(string(out)); token != "" {
+		return token, nil
+	}
+	return "", errors.New("no Kubernetes bearer token in test context, kubeconfig, or oc whoami -t")
 }
 
 func cooCSVMatchesPrefix(csvName, prefix string) bool {
@@ -885,7 +1080,8 @@ func kubernetesServiceProxyURL(apiHost, namespace, service string, port int, pat
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
-	if err := validateKubernetesProxyPath(path); err != nil {
+	resourcePath, rawQuery, _ := strings.Cut(path, "?")
+	if err := validateKubernetesProxyPath(resourcePath); err != nil {
 		return "", err
 	}
 	scheme := "http"
@@ -893,7 +1089,7 @@ func kubernetesServiceProxyURL(apiHost, namespace, service string, port int, pat
 		scheme = "https"
 	}
 	serviceRef := fmt.Sprintf("%s:%s:%d", scheme, service, port)
-	segments := strings.Split(strings.Trim(path, "/"), "/")
+	segments := strings.Split(strings.Trim(resourcePath, "/"), "/")
 	for i, segment := range segments {
 		segments[i] = url.PathEscape(segment)
 	}
@@ -903,6 +1099,9 @@ func kubernetesServiceProxyURL(apiHost, namespace, service string, port int, pat
 		serviceRef,
 		strings.Join(segments, "/"),
 	)
+	if rawQuery != "" {
+		proxyPath += "?" + rawQuery
+	}
 	endpoint, err := url.Parse(apiHost)
 	if err != nil {
 		return "", fmt.Errorf("invalid Kubernetes API host: %w", err)

@@ -114,6 +114,29 @@ func (tc *MonitoringTestCtx) monitoringOwnerReferencesCondition() gTypes.GomegaM
 	)
 }
 
+// jsonCompatibleValue converts values produced by gojq (e.g. int) into types
+// accepted by unstructured.SetNestedField / runtime.DeepCopyJSON.
+func jsonCompatibleValue(v any) any {
+	switch x := v.(type) {
+	case int:
+		return int64(x)
+	case int32:
+		return int64(x)
+	case map[string]any:
+		for k, val := range x {
+			x[k] = jsonCompatibleValue(val)
+		}
+		return x
+	case []any:
+		for i, val := range x {
+			x[i] = jsonCompatibleValue(val)
+		}
+		return x
+	default:
+		return v
+	}
+}
+
 // rebaseForDSCI wraps transforms so they operate on DSCI's .spec.monitoring
 // as if it were .spec on a Monitoring CR. This lets every existing transform
 // function work unchanged in DSC mode.
@@ -134,7 +157,11 @@ func rebaseForDSCI(transforms ...jq.TransformFn) jq.TransformFn {
 			}
 		}
 
-		return unstructured.SetNestedField(dsci.Object, temp.Object["spec"], "spec", "monitoring")
+		spec, _ := temp.Object["spec"].(map[string]any)
+		if spec == nil {
+			spec = map[string]any{}
+		}
+		return unstructured.SetNestedField(dsci.Object, jsonCompatibleValue(spec), "spec", "monitoring")
 	}
 }
 
@@ -237,10 +264,14 @@ func (tc *MonitoringTestCtx) setupBaseMonitoring(t *testing.T) {
 // setupMetrics enables metrics configuration with default storage settings.
 func (tc *MonitoringTestCtx) setupMetrics(t *testing.T) {
 	t.Helper()
-	tc.updateMonitoringConfig(
+	transforms := []jq.TransformFn{
 		withManagementState(common.Managed),
 		tc.withMetricsConfig(),
-	)
+	}
+	if tc.expectedDefaultReplicas > 0 {
+		transforms = append(transforms, withMetricsReplicas(tc.expectedDefaultReplicas))
+	}
+	tc.updateMonitoringConfig(transforms...)
 }
 
 // cleanupGroup performs group-level cleanup, resetting monitoring to a clean state.
@@ -604,7 +635,9 @@ func (tc *MonitoringTestCtx) withMetricsConfig() jq.TransformFn {
 }
 
 func withMetricsReplicas(replicas int) jq.TransformFn {
-	return jq.Transform(`.spec.metrics.replicas = %d`, replicas)
+	return func(u *unstructured.Unstructured) error {
+		return unstructured.SetNestedField(u.Object, int64(replicas), "spec", "metrics", "replicas")
+	}
 }
 
 func withNamespace(namespace string) jq.TransformFn {

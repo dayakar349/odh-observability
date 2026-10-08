@@ -4,7 +4,7 @@
 
 `TestLLMInferenceService` is a separate RHOAI integration suite. The monitoring commands below select `TestMonitoring` so they do not provision inference resources.
 
-`TestCOOVersionCompatibility` is the RHOAI 3.6 / COO 1.5 release gate. It validates fixed operator CSV lines (`cluster-observability-operator.v1.5`, `rhods-operator.v3.6`), the RHOAI-pinned Perses image, Perses operand health, and mandatory dashboard proxy APIs after a managed monitoring install with metrics enabled. COO and RHOAI CSV prefixes and dashboard probes cannot be overridden through flags or `E2E_TEST_*` environment variables. It restores monitoring configuration like `TestMonitoring` but does not run the full regression matrix.
+`TestCOOVersionCompatibility` is the RHOAI 3.6 / COO 1.5 release gate. It validates fixed operator CSV lines (`cluster-observability-operator.v1.5`, `rhods-operator.3.6`), the RHOAI-pinned Perses image, Perses operand health, and mandatory dashboard paths after metrics are enabled: Prometheus dashboard Route host, namespace-proxy PromQL (`up` with `namespace=`), Perses health and projects APIs, and the Dashboards UIPlugin when installed. COO and RHOAI CSV prefixes and dashboard probes cannot be overridden through flags or `E2E_TEST_*` environment variables. It restores monitoring configuration like `TestMonitoring` but does not run the full regression matrix.
 
 ```bash
 make e2e-test-coo-compatibility
@@ -76,7 +76,7 @@ Pass test flags through `E2E_TEST_FLAGS` for local Make targets. The container r
 | `-coo-channel` | `stable` | OLM channel for Cluster Observability Operator when `-install-operators=true` |
 | `-compatibility-report` | _(empty)_ | Optional JSON diagnostics filename or relative path under `ARTIFACTS` / `E2E_ARTIFACTS` / `e2e-artifacts` (report is always logged when the test fails) |
 
-`TestCOOVersionCompatibility` always requires COO CSV prefix `cluster-observability-operator.v1.5`, RHOAI CSV prefix `rhods-operator.v3.6`, the RHOAI-pinned Perses image digest, and Perses plus Prometheus dashboard proxy checks. Those requirements are not configurable.
+`TestCOOVersionCompatibility` always requires COO CSV prefix `cluster-observability-operator.v1.5`, RHOAI CSV prefix `rhods-operator.3.6`, the RHOAI-pinned Perses image digest, and Perses plus Prometheus dashboard proxy checks. Those requirements are not configurable.
 
 ### Bumping the release gate (e.g. RHOAI 3.7 / COO 1.6)
 
