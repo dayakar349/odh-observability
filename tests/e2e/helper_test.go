@@ -165,29 +165,6 @@ func (tc *TestContext) monitoringOwnerReferencesCondition() gTypes.GomegaMatcher
 	)
 }
 
-// jsonCompatibleValue converts values produced by gojq (e.g. int) into types
-// accepted by unstructured.SetNestedField / runtime.DeepCopyJSON.
-func jsonCompatibleValue(v any) any {
-	switch x := v.(type) {
-	case int:
-		return int64(x)
-	case int32:
-		return int64(x)
-	case map[string]any:
-		for k, val := range x {
-			x[k] = jsonCompatibleValue(val)
-		}
-		return x
-	case []any:
-		for i, val := range x {
-			x[i] = jsonCompatibleValue(val)
-		}
-		return x
-	default:
-		return v
-	}
-}
-
 // rebaseForDSCI wraps transforms so they operate on DSCI's .spec.monitoring
 // as if it were .spec on a Monitoring CR. This lets every existing transform
 // function work unchanged in DSC mode.

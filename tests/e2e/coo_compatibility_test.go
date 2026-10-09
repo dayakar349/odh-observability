@@ -305,7 +305,7 @@ func (tc *MonitoringTestCtx) validateDashboardProxyAPIs(t *testing.T, report *co
 	// Use the dashboard Route (not the API server service proxy): HTTPS backends do not receive the
 	// caller bearer token through /services/proxy, so in-cluster SAR checks would always fail.
 	promQueryPath := prometheusNamespaceProxyQueryPath(cooCompatibilityPromQLQuery, tc.MonitoringNamespace)
-	queryBody, queryStatus, err := tc.prometheusDashboardRouteGET(report.PrometheusRouteHost, promQueryPath)
+	queryBody, queryStatus, err := tc.prometheusDashboardRouteGET(t, report.PrometheusRouteHost, promQueryPath)
 	if err != nil {
 		failCompatibilityGate(t, report, "Prometheus dashboard proxy PromQL request failed", err)
 	}
@@ -382,7 +382,7 @@ func (tc *MonitoringTestCtx) enrichCompatibilityReport(t *testing.T, report *coo
 		report.MonitoringConditions = tc.monitoringConditionMap()
 	}
 	tc.enrichPersesOperandSnapshot(t, report)
-	tc.enrichDashboardProbeSnapshot(report)
+	tc.enrichDashboardProbeSnapshot(t, report)
 }
 
 func (tc *MonitoringTestCtx) enrichPersesOperandSnapshot(t *testing.T, report *cooCompatibilityReport) {
@@ -423,7 +423,8 @@ func (tc *MonitoringTestCtx) enrichPersesOperandSnapshot(t *testing.T, report *c
 	}
 }
 
-func (tc *MonitoringTestCtx) enrichDashboardProbeSnapshot(report *cooCompatibilityReport) {
+func (tc *MonitoringTestCtx) enrichDashboardProbeSnapshot(t *testing.T, report *cooCompatibilityReport) {
+	t.Helper()
 	if report.PersesProbe == "" {
 		_, status, err := tc.kubernetesServiceGET(tc.MonitoringNamespace, PersesName, persesServicePort, "/api/v1/health", false)
 		if err != nil {
@@ -434,7 +435,7 @@ func (tc *MonitoringTestCtx) enrichDashboardProbeSnapshot(report *cooCompatibili
 	}
 	if report.DashboardProbe == "" && report.PrometheusRouteHost != "" {
 		path := prometheusNamespaceProxyQueryPath(cooCompatibilityPromQLQuery, tc.MonitoringNamespace)
-		_, status, err := tc.prometheusDashboardRouteGET(report.PrometheusRouteHost, path)
+		_, status, err := tc.prometheusDashboardRouteGET(t, report.PrometheusRouteHost, path)
 		if err != nil {
 			report.CompatibilityNotes = append(report.CompatibilityNotes, "Prometheus probe: "+err.Error())
 		} else {
@@ -913,7 +914,8 @@ func prometheusDashboardRouteHost(route *unstructured.Unstructured) string {
 	return host
 }
 
-func (tc *MonitoringTestCtx) prometheusDashboardRouteGET(routeHost, path string) (string, int, error) {
+func (tc *MonitoringTestCtx) prometheusDashboardRouteGET(t *testing.T, routeHost, path string) (string, int, error) {
+	t.Helper()
 	if routeHost == "" {
 		return "", 0, errors.New("prometheus dashboard route host is empty")
 	}
@@ -928,11 +930,14 @@ func (tc *MonitoringTestCtx) prometheusDashboardRouteGET(routeHost, path string)
 	if err != nil {
 		return "", 0, err
 	}
+	rootCAs := clusterIngressCAPool(t, tc)
 	httpClient := &http.Client{
 		Timeout: compatibilityHTTPRequestTimeout,
 		Transport: &http.Transport{
-			//nolint:gosec // G402: e2e hits the cluster ingress Route; client uses kube bearer token, not a pinned route CA.
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			TLSClientConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				RootCAs:    rootCAs,
+			},
 		},
 	}
 	ctx, cancel := context.WithTimeout(tc.Context(), compatibilityHTTPRequestTimeout)
