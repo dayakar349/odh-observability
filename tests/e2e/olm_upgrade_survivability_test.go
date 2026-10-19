@@ -23,21 +23,21 @@ import (
 
 // olmUpgradeSurvivabilityReport captures baseline and post-upgrade evidence for upgrade diagnostics.
 type olmUpgradeSurvivabilityReport struct {
-	OpenShiftVersion     string                  `json:"openShiftVersion,omitempty"`
-	OperatorsRequested   []string                `json:"operatorsRequested,omitempty"`
-	Baseline             *olmUpgradeHealthSnapshot `json:"baseline,omitempty"`
-	PostUpgrade          *olmUpgradeHealthSnapshot `json:"postUpgrade,omitempty"`
-	OperatorTransitions  []operatorUpgradeTransition `json:"operatorTransitions,omitempty"`
-	FailedAssertion      string                  `json:"failedAssertion,omitempty"`
-	FirstLifecycleFailure string                 `json:"firstLifecycleFailure,omitempty"`
+	OpenShiftVersion      string                      `json:"openShiftVersion,omitempty"`
+	OperatorsRequested    []string                    `json:"operatorsRequested,omitempty"`
+	Baseline              *olmUpgradeHealthSnapshot   `json:"baseline,omitempty"`
+	PostUpgrade           *olmUpgradeHealthSnapshot   `json:"postUpgrade,omitempty"`
+	OperatorTransitions   []operatorUpgradeTransition `json:"operatorTransitions,omitempty"`
+	FailedAssertion       string                      `json:"failedAssertion,omitempty"`
+	FirstLifecycleFailure string                      `json:"firstLifecycleFailure,omitempty"`
 }
 
 type olmUpgradeHealthSnapshot struct {
-	ClusterObservabilityCSV string            `json:"clusterObservabilityCSV,omitempty"`
-	ClusterObservabilityVer string            `json:"clusterObservabilityVersion,omitempty"`
-	TempoOperatorCSV        string            `json:"tempoOperatorCSV,omitempty"`
-	TempoOperatorVer        string            `json:"tempoOperatorVersion,omitempty"`
-	MonitoringConditions    map[string]string `json:"monitoringConditions,omitempty"`
+	ClusterObservabilityCSV string                `json:"clusterObservabilityCSV,omitempty"`
+	ClusterObservabilityVer string                `json:"clusterObservabilityVersion,omitempty"`
+	TempoOperatorCSV        string                `json:"tempoOperatorCSV,omitempty"`
+	TempoOperatorVer        string                `json:"tempoOperatorVersion,omitempty"`
+	MonitoringConditions    map[string]string     `json:"monitoringConditions,omitempty"`
 	OLM                     []operatorOLMSnapshot `json:"olm,omitempty"`
 }
 
@@ -82,37 +82,52 @@ func olmUpgradeSurvivabilitySuite(t *testing.T) {
 	mctx.setupMetrics(t)
 
 	t.Run("Record pre-upgrade baseline", func(t *testing.T) {
-		report.Baseline = mctx.captureUpgradeHealthSnapshot(t)
-		mctx.assertOLMSnapshotsHealthy(t, report.Baseline.OLM)
+		report.Baseline = mctx.captureUpgradeHealthSnapshot(t, report)
+		mctx.assertOLMSnapshotsHealthy(t, report, report.Baseline.OLM)
 	})
 
 	t.Run("Exercise OLM upgrades", func(t *testing.T) {
-		report.OperatorTransitions = mctx.runConfiguredOperatorUpgrades(t, operators)
+		report.OperatorTransitions = mctx.runConfiguredOperatorUpgrades(t, report, operators)
+		if !upgradeTransitionsIncludePerformedUpgrade(report.OperatorTransitions) {
+			mctx.failUpgradeAssertion(t, report, "no operator upgrade was performed; target channels must differ from the current subscription channel")
+		}
 	})
 
 	t.Run("Post-upgrade monitoring health contract", func(t *testing.T) {
-		report.PostUpgrade = mctx.captureUpgradeHealthSnapshot(t)
-		mctx.assertOLMSnapshotsHealthy(t, report.PostUpgrade.OLM)
-		mctx.assertMonitoringUpgradeHealthContract(t)
+		report.PostUpgrade = mctx.captureUpgradeHealthSnapshot(t, report)
+		mctx.assertOLMSnapshotsHealthy(t, report, report.PostUpgrade.OLM)
+		mctx.assertMonitoringUpgradeHealthContract(t, report)
 	})
 
-	mctx.writeUpgradeSurvivabilityReport(t, report)
+	if !t.Failed() {
+		mctx.writeUpgradeSurvivabilityReport(t, report)
+	}
 }
 
-func (tc *MonitoringTestCtx) captureUpgradeHealthSnapshot(t *testing.T) *olmUpgradeHealthSnapshot {
+func (tc *MonitoringTestCtx) failUpgradeAssertion(t *testing.T, report *olmUpgradeSurvivabilityReport, assertion string) {
+	t.Helper()
+	report.FailedAssertion = assertion
+	t.Fatal(assertion)
+}
+
+func (tc *MonitoringTestCtx) captureUpgradeHealthSnapshot(t *testing.T, report *olmUpgradeSurvivabilityReport) *olmUpgradeHealthSnapshot {
 	t.Helper()
 	tc = tc.WithT(t)
 
 	snap := &olmUpgradeHealthSnapshot{
 		MonitoringConditions: tc.monitoringConditionMap(),
-		OLM:                  tc.collectUpgradeOperatorOLMSnapshots(t),
+		OLM:                  tc.collectUpgradeOperatorOLMSnapshots(t, report),
 	}
 
-	if csvName, version, err := tc.clusterObservabilityCSV(); err == nil {
+	if csvName, version, err := tc.clusterObservabilityCSV(); err != nil {
+		tc.failUpgradeAssertion(t, report, fmt.Sprintf("failed to read Cluster Observability Operator CSV: %v", err))
+	} else {
 		snap.ClusterObservabilityCSV = csvName
 		snap.ClusterObservabilityVer = version
 	}
-	if csvName, version, err := tc.tempoOperatorCSV(); err == nil {
+	if csvName, version, err := tc.tempoOperatorCSV(); err != nil {
+		tc.failUpgradeAssertion(t, report, fmt.Sprintf("failed to read Tempo Operator CSV: %v", err))
+	} else {
 		snap.TempoOperatorCSV = csvName
 		snap.TempoOperatorVer = version
 	}
@@ -149,21 +164,21 @@ func (tc *MonitoringTestCtx) tempoOperatorCSV() (string, string, error) {
 	return csvName, version, nil
 }
 
-func (tc *MonitoringTestCtx) collectUpgradeOperatorOLMSnapshots(t *testing.T) []operatorOLMSnapshot {
+func (tc *MonitoringTestCtx) collectUpgradeOperatorOLMSnapshots(t *testing.T, report *olmUpgradeSurvivabilityReport) []operatorOLMSnapshot {
 	t.Helper()
 	operators, err := parseUpgradeOperators(testOpts.upgradeOperators)
 	if err != nil {
-		t.Fatalf("invalid upgrade-operators: %v", err)
+		tc.failUpgradeAssertion(t, report, fmt.Sprintf("invalid upgrade-operators: %v", err))
 	}
 	snapshots := make([]operatorOLMSnapshot, 0, len(operators))
 	for _, operator := range operators {
 		ns, name, err := upgradeOperatorSubscription(operator)
 		if err != nil {
-			t.Fatalf("%v", err)
+			tc.failUpgradeAssertion(t, report, err.Error())
 		}
 		snap, err := tc.operatorOLMSnapshot(ns, name)
 		if err != nil {
-			t.Fatalf("failed to snapshot OLM state for %s/%s: %v", ns, name, err)
+			tc.failUpgradeAssertion(t, report, fmt.Sprintf("failed to snapshot OLM state for %s/%s: %v", ns, name, err))
 		}
 		snapshots = append(snapshots, snap)
 	}
@@ -201,14 +216,14 @@ func (tc *MonitoringTestCtx) operatorOLMSnapshot(namespace, name string) (operat
 	return snap, nil
 }
 
-func (tc *MonitoringTestCtx) assertOLMSnapshotsHealthy(t *testing.T, snapshots []operatorOLMSnapshot) {
+func (tc *MonitoringTestCtx) assertOLMSnapshotsHealthy(t *testing.T, report *olmUpgradeSurvivabilityReport, snapshots []operatorOLMSnapshot) {
 	t.Helper()
 	if failure := firstOLMLifecycleFailure(snapshots); failure != "" {
-		t.Fatalf("OLM lifecycle failure: %s", failure)
+		tc.failUpgradeAssertion(t, report, "OLM lifecycle failure: "+failure)
 	}
 }
 
-func (tc *MonitoringTestCtx) runConfiguredOperatorUpgrades(t *testing.T, operators []string) []operatorUpgradeTransition {
+func (tc *MonitoringTestCtx) runConfiguredOperatorUpgrades(t *testing.T, report *olmUpgradeSurvivabilityReport, operators []string) []operatorUpgradeTransition {
 	t.Helper()
 	tc = tc.WithT(t)
 
@@ -253,8 +268,8 @@ func (tc *MonitoringTestCtx) runConfiguredOperatorUpgrades(t *testing.T, operato
 		transition.TargetCSV = after.InstalledCSV
 		transitions = append(transitions, transition)
 
-		tc.assertOLMSnapshotsHealthy(t, []operatorOLMSnapshot{after})
-		tc.assertMonitoringOperandsWithoutBlockingFinalizers(t)
+		tc.assertOLMSnapshotsHealthy(t, report, []operatorOLMSnapshot{after})
+		tc.assertMonitoringOperandsWithoutBlockingFinalizers(t, report)
 	}
 	return transitions
 }
@@ -265,7 +280,10 @@ func stringsEqualFoldTrim(a, b string) bool {
 
 func (tc *MonitoringTestCtx) patchSubscriptionChannel(t *testing.T, nn types.NamespacedName, channel string) {
 	t.Helper()
-	patch := []byte(fmt.Sprintf(`{"spec":{"channel":"%s"}}`, channel))
+	patch, err := json.Marshal(map[string]any{"spec": map[string]any{"channel": channel}})
+	if err != nil {
+		t.Fatalf("failed to build subscription patch: %v", err)
+	}
 	tc.g.Eventually(func() error {
 		sub := &unstructured.Unstructured{}
 		sub.SetGroupVersionKind(gvk.Subscription)
@@ -273,7 +291,7 @@ func (tc *MonitoringTestCtx) patchSubscriptionChannel(t *testing.T, nn types.Nam
 			return err
 		}
 		return tc.client.Patch(tc.ctx, sub, client.RawPatch(types.MergePatchType, patch))
-	}).WithTimeout(2 * time.Minute).WithPolling(2 * time.Second).Should(Succeed(),
+	}).WithTimeout(2*time.Minute).WithPolling(2*time.Second).Should(Succeed(),
 		"failed to patch Subscription %s channel to %s", nn, channel)
 	t.Logf("patched Subscription %s/%s to channel %s", nn.Namespace, nn.Name, channel)
 }
@@ -292,11 +310,11 @@ func (tc *MonitoringTestCtx) waitForOperatorUpgrade(t *testing.T, namespace, nam
 		g.Expect(csvPhaseIndicatesStuckLifecycle(snap.CSVPhase)).To(BeFalse(),
 			"CSV %s should not be stuck in phase %q", snap.InstalledCSV, snap.CSVPhase)
 		g.Expect(snap.CSVPhase).To(Equal("Succeeded"), "CSV %s phase", snap.InstalledCSV)
-	}).WithTimeout(timeout).WithPolling(15 * time.Second).Should(Succeed(),
+	}).WithTimeout(timeout).WithPolling(15*time.Second).Should(Succeed(),
 		"operator %s/%s did not converge after OLM upgrade within %s", namespace, name, timeout)
 }
 
-func (tc *MonitoringTestCtx) assertMonitoringOperandsWithoutBlockingFinalizers(t *testing.T) {
+func (tc *MonitoringTestCtx) assertMonitoringOperandsWithoutBlockingFinalizers(t *testing.T, report *olmUpgradeSurvivabilityReport) {
 	t.Helper()
 	tc = tc.WithT(t)
 
@@ -319,13 +337,13 @@ func (tc *MonitoringTestCtx) assertMonitoringOperandsWithoutBlockingFinalizers(t
 			continue
 		}
 		if finalizers := obj.GetFinalizers(); len(finalizers) > 0 {
-			t.Fatalf("%s %s is deleting with finalizers %v after OLM upgrade (possible stale cleanup)",
-				resource.gvk.Kind, resource.name, finalizers)
+			tc.failUpgradeAssertion(t, report, fmt.Sprintf("%s %s is deleting with finalizers %v after OLM upgrade (possible stale cleanup)",
+				resource.gvk.Kind, resource.name, finalizers))
 		}
 	}
 }
 
-func (tc *MonitoringTestCtx) assertMonitoringUpgradeHealthContract(t *testing.T) {
+func (tc *MonitoringTestCtx) assertMonitoringUpgradeHealthContract(t *testing.T, report *olmUpgradeSurvivabilityReport) {
 	t.Helper()
 	tc = tc.WithT(t)
 
@@ -343,7 +361,13 @@ func (tc *MonitoringTestCtx) assertMonitoringUpgradeHealthContract(t *testing.T)
 
 	compat := &cooCompatibilityReport{}
 	tc.validatePersesOperandHealth(t, compat)
+	if compat.FailedAssertion != "" {
+		tc.failUpgradeAssertion(t, report, compat.FailedAssertion)
+	}
 	tc.validateDashboardProxyAPIs(t, compat)
+	if compat.FailedAssertion != "" {
+		tc.failUpgradeAssertion(t, report, compat.FailedAssertion)
+	}
 }
 
 func (tc *MonitoringTestCtx) writeUpgradeSurvivabilityReport(t *testing.T, report *olmUpgradeSurvivabilityReport) {

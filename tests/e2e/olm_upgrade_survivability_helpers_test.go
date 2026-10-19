@@ -75,10 +75,17 @@ func subscriptionInstalledCSV(sub *unstructured.Unstructured) string {
 	return csvName
 }
 
+func csvPhaseIsHealthy(phase string) bool {
+	return strings.TrimSpace(phase) == "Succeeded"
+}
+
 func csvPhaseIndicatesStuckLifecycle(phase string) bool {
 	phase = strings.TrimSpace(phase)
 	if phase == "" {
 		return true
+	}
+	if csvPhaseIsHealthy(phase) {
+		return false
 	}
 	return slices.Contains(csvPhasesStuck, phase)
 }
@@ -91,7 +98,7 @@ func firstOLMLifecycleFailure(snapshots []operatorOLMSnapshot) string {
 				snap.SubscriptionNamespace, snap.SubscriptionName, snap.InstallPlanRef,
 			)
 		}
-		if csvPhaseIndicatesStuckLifecycle(snap.CSVPhase) {
+		if !csvPhaseIsHealthy(snap.CSVPhase) {
 			return fmt.Sprintf(
 				"CSV %s/%s phase is %q (subscription %s/%s channel=%s startingCSV=%s)",
 				snap.SubscriptionNamespace, snap.InstalledCSV, snap.CSVPhase,
@@ -100,6 +107,15 @@ func firstOLMLifecycleFailure(snapshots []operatorOLMSnapshot) string {
 		}
 	}
 	return ""
+}
+
+func upgradeTransitionsIncludePerformedUpgrade(transitions []operatorUpgradeTransition) bool {
+	for _, transition := range transitions {
+		if !transition.Skipped {
+			return true
+		}
+	}
+	return false
 }
 
 func upgradeTargetChannelForOperator(operator string) string {
@@ -113,7 +129,7 @@ func upgradeTargetChannelForOperator(operator string) string {
 	}
 }
 
-func upgradeOperatorSubscription(operator string) (namespace, name string, err error) {
+func upgradeOperatorSubscription(operator string) (string, string, error) {
 	switch operator {
 	case upgradeOperatorCOO:
 		return observabilityOpNamespace, observabilityOpName, nil
