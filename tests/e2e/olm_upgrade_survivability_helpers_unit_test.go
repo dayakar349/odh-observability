@@ -36,6 +36,25 @@ func TestFirstOLMLifecycleFailure(t *testing.T) {
 	}); msg == "" {
 		t.Fatal("expected stuck CSV to be reported")
 	}
+
+	if msg := firstOLMLifecycleFailure([]operatorOLMSnapshot{
+		{SubscriptionNamespace: "ns", SubscriptionName: "sub", InstalledCSV: "csv", CSVPhase: "InstallReady"},
+	}); msg == "" {
+		t.Fatal("expected non-Succeeded CSV phase to be reported")
+	}
+}
+
+func TestUpgradeTransitionsIncludePerformedUpgrade(t *testing.T) {
+	if upgradeTransitionsIncludePerformedUpgrade([]operatorUpgradeTransition{
+		{Skipped: true},
+	}) {
+		t.Fatal("expected all-skipped transitions to be rejected")
+	}
+	if !upgradeTransitionsIncludePerformedUpgrade([]operatorUpgradeTransition{
+		{Skipped: false},
+	}) {
+		t.Fatal("expected performed upgrade when Skipped is false")
+	}
 }
 
 func TestSubscriptionInstalledCSV(t *testing.T) {

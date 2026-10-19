@@ -92,8 +92,12 @@ func (c *TestContextConfig) validate() error {
 		}
 	}
 	if c.upgradeEnabled {
-		if _, err := parseUpgradeOperators(c.upgradeOperators); err != nil {
+		operators, err := parseUpgradeOperators(c.upgradeOperators)
+		if err != nil {
 			return fmt.Errorf("invalid upgrade-operators: %w", err)
+		}
+		if !upgradeConfigHasTargetChannel(*c, operators) {
+			return errors.New("upgrade-enabled requires at least one target channel (-upgrade-coo-channel or -upgrade-tempo-channel) for the selected -upgrade-operators")
 		}
 	}
 	if err := validateForbiddenCompatibilityGateOverrides(); err != nil {
@@ -119,12 +123,28 @@ func (c *TestContextConfig) applyDefaults() {
 		c.Timeouts.defaultConsistentlyPollInterval = 2 * time.Second
 	}
 	if c.Timeouts.olmOperationTimeout <= 0 {
-		c.Timeouts.olmOperationTimeout = 5 * time.Minute
+		if c.upgradeEnabled {
+			c.Timeouts.olmOperationTimeout = 30 * time.Minute
+		} else {
+			c.Timeouts.olmOperationTimeout = 5 * time.Minute
+		}
 	}
-	if c.upgradeEnabled && c.Timeouts.olmOperationTimeout < 30*time.Minute {
-		// Upgrades routinely exceed fresh-install OLM waits; extend unless explicitly tuned.
-		c.Timeouts.olmOperationTimeout = 30 * time.Minute
+}
+
+func upgradeConfigHasTargetChannel(c TestContextConfig, operators []string) bool {
+	for _, operator := range operators {
+		switch operator {
+		case upgradeOperatorCOO:
+			if strings.TrimSpace(c.upgradeCOOChannel) != "" {
+				return true
+			}
+		case upgradeOperatorTempo:
+			if strings.TrimSpace(c.upgradeTempoChannel) != "" {
+				return true
+			}
+		}
 	}
+	return false
 }
 
 func compatibilityReportBaseDir() (string, error) {

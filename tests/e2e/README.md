@@ -13,8 +13,9 @@ make e2e-test-coo-compatibility
 ```
 
 ```bash
-make e2e-test-olm-upgrade-survivability \
-  E2E_TEST_FLAGS="-api-mode=dsc -install-operators=false -upgrade-coo-channel=<target> -upgrade-tempo-channel=<target>"
+E2E_TEST_API_MODE=dsc E2E_TEST_INSTALL_OPERATORS=false \
+  E2E_TEST_UPGRADE_COO_CHANNEL=<target> E2E_TEST_UPGRADE_TEMPO_CHANNEL=<target> \
+  make e2e-test-olm-upgrade-survivability
 ```
 
 DSC mode on a cluster with RHOAI already installed:
