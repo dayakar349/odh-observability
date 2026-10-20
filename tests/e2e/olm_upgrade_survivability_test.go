@@ -85,6 +85,9 @@ func olmUpgradeSurvivabilitySuite(t *testing.T) {
 		report.Baseline = mctx.captureUpgradeHealthSnapshot(t, report)
 		mctx.assertOLMSnapshotsHealthy(t, report, report.Baseline.OLM)
 	})
+	if t.Failed() {
+		return
+	}
 
 	t.Run("Exercise OLM upgrades", func(t *testing.T) {
 		report.OperatorTransitions = mctx.runConfiguredOperatorUpgrades(t, report, operators)
@@ -92,6 +95,9 @@ func olmUpgradeSurvivabilitySuite(t *testing.T) {
 			mctx.failUpgradeAssertion(t, report, "no operator upgrade was performed; target channels must differ from the current subscription channel")
 		}
 	})
+	if t.Failed() {
+		return
+	}
 
 	t.Run("Post-upgrade monitoring health contract", func(t *testing.T) {
 		report.PostUpgrade = mctx.captureUpgradeHealthSnapshot(t, report)
