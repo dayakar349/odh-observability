@@ -90,7 +90,7 @@ func olmUpgradeSurvivabilitySuite(t *testing.T) {
 	}
 
 	t.Run("Exercise OLM upgrades", func(t *testing.T) {
-		report.OperatorTransitions = mctx.runConfiguredOperatorUpgrades(t, report, operators)
+		mctx.runConfiguredOperatorUpgrades(t, report, operators)
 		if !upgradeTransitionsIncludePerformedUpgrade(report.OperatorTransitions) {
 			mctx.failUpgradeAssertion(t, report, "no operator upgrade was performed; target channels must differ from the current subscription channel")
 		}
@@ -229,18 +229,17 @@ func (tc *MonitoringTestCtx) assertOLMSnapshotsHealthy(t *testing.T, report *olm
 	}
 }
 
-func (tc *MonitoringTestCtx) runConfiguredOperatorUpgrades(t *testing.T, report *olmUpgradeSurvivabilityReport, operators []string) []operatorUpgradeTransition {
+func (tc *MonitoringTestCtx) runConfiguredOperatorUpgrades(t *testing.T, report *olmUpgradeSurvivabilityReport, operators []string) {
 	t.Helper()
 	tc = tc.WithT(t)
 
-	transitions := make([]operatorUpgradeTransition, 0, len(operators))
 	for _, operator := range operators {
 		transition := operatorUpgradeTransition{Operator: operator}
 		targetChannel := upgradeTargetChannelForOperator(operator)
 		if targetChannel == "" {
 			transition.Skipped = true
 			transition.SkipReason = "no target channel configured for operator"
-			transitions = append(transitions, transition)
+			report.OperatorTransitions = append(report.OperatorTransitions, transition)
 			t.Logf("skipping %s upgrade: %s", operator, transition.SkipReason)
 			continue
 		}
@@ -248,11 +247,11 @@ func (tc *MonitoringTestCtx) runConfiguredOperatorUpgrades(t *testing.T, report 
 
 		ns, name, err := upgradeOperatorSubscription(operator)
 		if err != nil {
-			t.Fatalf("%v", err)
+			tc.failUpgradeAssertion(t, report, err.Error())
 		}
 		before, err := tc.operatorOLMSnapshot(ns, name)
 		if err != nil {
-			t.Fatalf("failed to read pre-upgrade OLM state for %s: %v", operator, err)
+			tc.failUpgradeAssertion(t, report, fmt.Sprintf("failed to read pre-upgrade OLM state for %s: %v", operator, err))
 		}
 		transition.SourceCSV = before.InstalledCSV
 
@@ -260,7 +259,7 @@ func (tc *MonitoringTestCtx) runConfiguredOperatorUpgrades(t *testing.T, report 
 			transition.TargetCSV = before.InstalledCSV
 			transition.Skipped = true
 			transition.SkipReason = "subscription already on target channel with installed CSV"
-			transitions = append(transitions, transition)
+			report.OperatorTransitions = append(report.OperatorTransitions, transition)
 			t.Logf("skipping %s upgrade: already on channel %s with CSV %s", operator, targetChannel, before.InstalledCSV)
 			continue
 		}
@@ -269,15 +268,14 @@ func (tc *MonitoringTestCtx) runConfiguredOperatorUpgrades(t *testing.T, report 
 		tc.waitForOperatorUpgrade(t, ns, name, before.InstalledCSV)
 		after, err := tc.operatorOLMSnapshot(ns, name)
 		if err != nil {
-			t.Fatalf("failed to read post-upgrade OLM state for %s: %v", operator, err)
+			tc.failUpgradeAssertion(t, report, fmt.Sprintf("failed to read post-upgrade OLM state for %s: %v", operator, err))
 		}
 		transition.TargetCSV = after.InstalledCSV
-		transitions = append(transitions, transition)
+		report.OperatorTransitions = append(report.OperatorTransitions, transition)
 
 		tc.assertOLMSnapshotsHealthy(t, report, []operatorOLMSnapshot{after})
 		tc.assertMonitoringOperandsWithoutBlockingFinalizers(t, report)
 	}
-	return transitions
 }
 
 func stringsEqualFoldTrim(a, b string) bool {
@@ -334,24 +332,31 @@ func (tc *MonitoringTestCtx) assertMonitoringOperandsWithoutBlockingFinalizers(t
 		{gvk.MonitoringStack, MonitoringStackName, tc.MonitoringNamespace},
 		{gvk.StatefulSet, PersesName, tc.MonitoringNamespace},
 	}
+	cleanupTimeout := 10 * time.Minute
 	for _, resource := range resources {
-		obj := tc.FetchResource(WithMinimalObject(resource.gvk, types.NamespacedName{
-			Name:      resource.name,
-			Namespace: resource.namespace,
-		}))
-		if obj.GetDeletionTimestamp() == nil {
-			continue
-		}
-		if finalizers := obj.GetFinalizers(); len(finalizers) > 0 {
-			tc.failUpgradeAssertion(t, report, fmt.Sprintf("%s %s is deleting with finalizers %v after OLM upgrade (possible stale cleanup)",
-				resource.gvk.Kind, resource.name, finalizers))
-		}
+		nn := types.NamespacedName{Name: resource.name, Namespace: resource.namespace}
+		tc.g.Eventually(func(g Gomega) {
+			obj := tc.FetchResource(WithMinimalObject(resource.gvk, nn))
+			if obj.GetDeletionTimestamp() == nil {
+				return
+			}
+			g.Expect(obj.GetFinalizers()).To(BeEmpty(),
+				"%s %s is still deleting with finalizers after OLM upgrade", resource.gvk.Kind, resource.name)
+		}).WithTimeout(cleanupTimeout).WithPolling(15*time.Second).Should(Succeed(),
+			"%s %s did not finish deletion cleanup within %s after OLM upgrade", resource.gvk.Kind, resource.name, cleanupTimeout)
 	}
 }
 
 func (tc *MonitoringTestCtx) assertMonitoringUpgradeHealthContract(t *testing.T, report *olmUpgradeSurvivabilityReport) {
 	t.Helper()
 	tc = tc.WithT(t)
+
+	compat := &cooCompatibilityReport{}
+	defer func() {
+		if compat.FailedAssertion != "" {
+			report.FailedAssertion = compat.FailedAssertion
+		}
+	}()
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
@@ -365,15 +370,8 @@ func (tc *MonitoringTestCtx) assertMonitoringUpgradeHealthContract(t *testing.T,
 		WithCustomErrorMsg("Monitoring should be Ready with metrics stack, Thanos, and Perses available after OLM upgrade"),
 	)
 
-	compat := &cooCompatibilityReport{}
 	tc.validatePersesOperandHealth(t, compat)
-	if compat.FailedAssertion != "" {
-		tc.failUpgradeAssertion(t, report, compat.FailedAssertion)
-	}
 	tc.validateDashboardProxyAPIs(t, compat)
-	if compat.FailedAssertion != "" {
-		tc.failUpgradeAssertion(t, report, compat.FailedAssertion)
-	}
 }
 
 func (tc *MonitoringTestCtx) writeUpgradeSurvivabilityReport(t *testing.T, report *olmUpgradeSurvivabilityReport) {
