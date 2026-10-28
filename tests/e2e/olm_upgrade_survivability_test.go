@@ -8,6 +8,7 @@ import (
 	"time"
 
 	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -265,7 +266,7 @@ func (tc *MonitoringTestCtx) runConfiguredOperatorUpgrades(t *testing.T, report 
 		}
 
 		tc.patchSubscriptionChannel(t, types.NamespacedName{Namespace: ns, Name: name}, targetChannel)
-		tc.waitForOperatorUpgrade(t, ns, name, before.InstalledCSV)
+		tc.waitForOperatorUpgrade(t, report, ns, name, before.InstalledCSV)
 		after, err := tc.operatorOLMSnapshot(ns, name)
 		if err != nil {
 			tc.failUpgradeAssertion(t, report, fmt.Sprintf("failed to read post-upgrade OLM state for %s: %v", operator, err))
@@ -300,9 +301,15 @@ func (tc *MonitoringTestCtx) patchSubscriptionChannel(t *testing.T, nn types.Nam
 	t.Logf("patched Subscription %s/%s to channel %s", nn.Namespace, nn.Name, channel)
 }
 
-func (tc *MonitoringTestCtx) waitForOperatorUpgrade(t *testing.T, namespace, name, previousCSV string) {
+func (tc *MonitoringTestCtx) waitForOperatorUpgrade(t *testing.T, report *olmUpgradeSurvivabilityReport, namespace, name, previousCSV string) {
 	t.Helper()
 	timeout := tc.Timeouts.olmOperationTimeout
+	failureMsg := fmt.Sprintf("operator %s/%s did not converge after OLM upgrade within %s", namespace, name, timeout)
+	defer func() {
+		if t.Failed() && report.FailedAssertion == "" {
+			report.FailedAssertion = failureMsg
+		}
+	}()
 	tc.g.Eventually(func(g Gomega) {
 		snap, err := tc.operatorOLMSnapshot(namespace, name)
 		g.Expect(err).NotTo(HaveOccurred(), "failed to read subscription %s/%s during upgrade", namespace, name)
@@ -314,8 +321,7 @@ func (tc *MonitoringTestCtx) waitForOperatorUpgrade(t *testing.T, namespace, nam
 		g.Expect(csvPhaseIndicatesStuckLifecycle(snap.CSVPhase)).To(BeFalse(),
 			"CSV %s should not be stuck in phase %q", snap.InstalledCSV, snap.CSVPhase)
 		g.Expect(snap.CSVPhase).To(Equal("Succeeded"), "CSV %s phase", snap.InstalledCSV)
-	}).WithTimeout(timeout).WithPolling(15*time.Second).Should(Succeed(),
-		"operator %s/%s did not converge after OLM upgrade within %s", namespace, name, timeout)
+	}).WithTimeout(timeout).WithPolling(15*time.Second).Should(Succeed(), failureMsg)
 }
 
 func (tc *MonitoringTestCtx) assertMonitoringOperandsWithoutBlockingFinalizers(t *testing.T, report *olmUpgradeSurvivabilityReport) {
@@ -335,15 +341,24 @@ func (tc *MonitoringTestCtx) assertMonitoringOperandsWithoutBlockingFinalizers(t
 	cleanupTimeout := 10 * time.Minute
 	for _, resource := range resources {
 		nn := types.NamespacedName{Name: resource.name, Namespace: resource.namespace}
-		tc.g.Eventually(func(g Gomega) {
-			obj := tc.FetchResource(WithMinimalObject(resource.gvk, nn))
-			if obj.GetDeletionTimestamp() == nil {
-				return
+		failureMsg := fmt.Sprintf("%s %s did not finish deletion cleanup within %s after OLM upgrade",
+			resource.gvk.Kind, resource.name, cleanupTimeout)
+		tc.g.Eventually(func() error {
+			obj, err := tc.fetchResource(t, resource.gvk, nn)
+			if err != nil {
+				if k8serr.IsNotFound(err) {
+					return nil
+				}
+				return err
 			}
-			g.Expect(obj.GetFinalizers()).To(BeEmpty(),
-				"%s %s is still deleting with finalizers after OLM upgrade", resource.gvk.Kind, resource.name)
-		}).WithTimeout(cleanupTimeout).WithPolling(15*time.Second).Should(Succeed(),
-			"%s %s did not finish deletion cleanup within %s after OLM upgrade", resource.gvk.Kind, resource.name, cleanupTimeout)
+			if obj.GetDeletionTimestamp() == nil {
+				return nil
+			}
+			if finalizers := obj.GetFinalizers(); len(finalizers) > 0 {
+				return fmt.Errorf("%s %s is still deleting with finalizers %v", resource.gvk.Kind, resource.name, finalizers)
+			}
+			return nil
+		}).WithTimeout(cleanupTimeout).WithPolling(15*time.Second).Should(Succeed(), failureMsg)
 	}
 }
 
