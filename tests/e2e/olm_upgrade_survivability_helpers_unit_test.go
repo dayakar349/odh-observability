@@ -57,6 +57,22 @@ func TestUpgradeTransitionsIncludePerformedUpgrade(t *testing.T) {
 	}
 }
 
+func TestSubscriptionInstallPlanApprovalIsManual(t *testing.T) {
+	if subscriptionInstallPlanApprovalIsManual(nil) {
+		t.Fatal("nil subscription should not be Manual")
+	}
+	if subscriptionInstallPlanApprovalIsManual(&unstructured.Unstructured{Object: map[string]any{
+		"spec": map[string]any{"installPlanApproval": "Automatic"},
+	}}) {
+		t.Fatal("Automatic should not be Manual")
+	}
+	if !subscriptionInstallPlanApprovalIsManual(&unstructured.Unstructured{Object: map[string]any{
+		"spec": map[string]any{"installPlanApproval": "Manual"},
+	}}) {
+		t.Fatal("expected Manual approval policy")
+	}
+}
+
 func TestSubscriptionInstalledCSV(t *testing.T) {
 	sub := &unstructured.Unstructured{Object: map[string]any{
 		"status": map[string]any{"installedCSV": "a"},

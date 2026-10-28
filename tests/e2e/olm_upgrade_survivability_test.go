@@ -301,6 +301,47 @@ func (tc *MonitoringTestCtx) patchSubscriptionChannel(t *testing.T, nn types.Nam
 	t.Logf("patched Subscription %s/%s to channel %s", nn.Namespace, nn.Name, channel)
 }
 
+func (tc *MonitoringTestCtx) approvePendingInstallPlanForSubscription(t *testing.T, subscriptionNamespace, subscriptionName string) error {
+	t.Helper()
+	sub, err := tc.fetchResource(tc.t, gvk.Subscription, types.NamespacedName{
+		Namespace: subscriptionNamespace,
+		Name:      subscriptionName,
+	})
+	if err != nil {
+		return fmt.Errorf("read subscription %s/%s: %w", subscriptionNamespace, subscriptionName, err)
+	}
+	if !subscriptionInstallPlanApprovalIsManual(sub) {
+		return nil
+	}
+	installPlanName, found, _ := unstructured.NestedString(sub.Object, "status", "installPlanRef", "name")
+	if !found || installPlanName == "" {
+		return nil
+	}
+	installPlanNamespace, _, _ := unstructured.NestedString(sub.Object, "status", "installPlanRef", "namespace")
+	if installPlanNamespace == "" {
+		installPlanNamespace = subscriptionNamespace
+	}
+	ipNN := types.NamespacedName{Name: installPlanName, Namespace: installPlanNamespace}
+	ip, err := tc.fetchResource(tc.t, gvk.InstallPlan, ipNN)
+	if err != nil {
+		return fmt.Errorf("read InstallPlan %s: %w", ipNN, err)
+	}
+	approved, found, _ := unstructured.NestedBool(ip.Object, "spec", "approved")
+	if found && approved {
+		return nil
+	}
+	patch, err := json.Marshal(map[string]any{"spec": map[string]any{"approved": true}})
+	if err != nil {
+		return fmt.Errorf("build InstallPlan approval patch: %w", err)
+	}
+	if err := tc.client.Patch(tc.ctx, ip, client.RawPatch(types.MergePatchType, patch)); err != nil {
+		return fmt.Errorf("approve InstallPlan %s: %w", ipNN, err)
+	}
+	t.Logf("approved InstallPlan %s/%s for Manual subscription %s/%s",
+		installPlanNamespace, installPlanName, subscriptionNamespace, subscriptionName)
+	return nil
+}
+
 func (tc *MonitoringTestCtx) waitForOperatorUpgrade(t *testing.T, report *olmUpgradeSurvivabilityReport, namespace, name, previousCSV string) {
 	t.Helper()
 	timeout := tc.Timeouts.olmOperationTimeout
@@ -311,6 +352,8 @@ func (tc *MonitoringTestCtx) waitForOperatorUpgrade(t *testing.T, report *olmUpg
 		}
 	}()
 	tc.g.Eventually(func(g Gomega) {
+		g.Expect(tc.approvePendingInstallPlanForSubscription(t, namespace, name)).To(Succeed(),
+			"approve pending InstallPlan for subscription %s/%s", namespace, name)
 		snap, err := tc.operatorOLMSnapshot(namespace, name)
 		g.Expect(err).NotTo(HaveOccurred(), "failed to read subscription %s/%s during upgrade", namespace, name)
 		g.Expect(snap.InstalledCSV).NotTo(BeEmpty(), "subscription %s/%s should have installed CSV", namespace, name)

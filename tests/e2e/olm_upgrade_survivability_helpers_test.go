@@ -139,3 +139,11 @@ func upgradeOperatorSubscription(operator string) (string, string, error) {
 		return "", "", fmt.Errorf("unsupported upgrade operator %q", operator)
 	}
 }
+
+func subscriptionInstallPlanApprovalIsManual(sub *unstructured.Unstructured) bool {
+	if sub == nil {
+		return false
+	}
+	approval, _, _ := unstructured.NestedString(sub.Object, "spec", "installPlanApproval")
+	return strings.EqualFold(strings.TrimSpace(approval), "Manual")
+}
