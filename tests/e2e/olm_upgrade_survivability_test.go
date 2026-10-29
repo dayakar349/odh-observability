@@ -3,6 +3,7 @@ package e2e_test
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -220,7 +221,54 @@ func (tc *MonitoringTestCtx) operatorOLMSnapshot(namespace, name string) (operat
 	}
 	snap.CSVPhase, _, _ = unstructured.NestedString(csv.Object, "status", "phase")
 	snap.CSVVersion, _, _ = unstructured.NestedString(csv.Object, "spec", "version")
+
+	snap.OperatorCSVs, err = tc.listOperatorCSVPhases(namespace, name)
+	if err != nil {
+		return snap, err
+	}
 	return snap, nil
+}
+
+func (tc *MonitoringTestCtx) listOperatorCSVPhases(namespace, subscriptionName string) ([]operatorCSVPhase, error) {
+	prefix := operatorCSVNamePrefix(subscriptionName)
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   gvk.ClusterServiceVersion.Group,
+		Version: gvk.ClusterServiceVersion.Version,
+		Kind:    gvk.ClusterServiceVersion.Kind + "List",
+	})
+	if err := tc.client.List(tc.ctx, list, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("list ClusterServiceVersions in %s: %w", namespace, err)
+	}
+	phases := make([]operatorCSVPhase, 0)
+	for _, item := range list.Items {
+		if !strings.HasPrefix(item.GetName(), prefix) {
+			continue
+		}
+		phase, _, _ := unstructured.NestedString(item.Object, "status", "phase")
+		phases = append(phases, operatorCSVPhase{Name: item.GetName(), Phase: phase})
+	}
+	slices.SortFunc(phases, func(a, b operatorCSVPhase) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	return phases, nil
+}
+
+func (tc *MonitoringTestCtx) recordFailedOLMUpgradeState(report *olmUpgradeSurvivabilityReport, snap operatorOLMSnapshot) {
+	if report.PostUpgrade == nil {
+		report.PostUpgrade = &olmUpgradeHealthSnapshot{}
+	}
+	report.PostUpgrade.OLM = []operatorOLMSnapshot{snap}
+	if msg := firstOLMLifecycleFailure([]operatorOLMSnapshot{snap}); msg != "" {
+		report.FirstLifecycleFailure = msg
+		return
+	}
+	if snap.InstalledCSV != "" {
+		report.FirstLifecycleFailure = fmt.Sprintf(
+			"OLM upgrade timed out for subscription %s/%s with installed CSV %s phase %q (installPlanRef=%s)",
+			snap.SubscriptionNamespace, snap.SubscriptionName, snap.InstalledCSV, snap.CSVPhase, snap.InstallPlanRef,
+		)
+	}
 }
 
 func (tc *MonitoringTestCtx) assertOLMSnapshotsHealthy(t *testing.T, report *olmUpgradeSurvivabilityReport, snapshots []operatorOLMSnapshot) {
@@ -346,8 +394,15 @@ func (tc *MonitoringTestCtx) waitForOperatorUpgrade(t *testing.T, report *olmUpg
 	t.Helper()
 	timeout := tc.Timeouts.olmOperationTimeout
 	failureMsg := fmt.Sprintf("operator %s/%s did not converge after OLM upgrade within %s", namespace, name, timeout)
+	var lastSnap operatorOLMSnapshot
 	defer func() {
-		if t.Failed() && report.FailedAssertion == "" {
+		if !t.Failed() {
+			return
+		}
+		if lastSnap.SubscriptionName != "" {
+			tc.recordFailedOLMUpgradeState(report, lastSnap)
+		}
+		if report.FailedAssertion == "" {
 			report.FailedAssertion = failureMsg
 		}
 	}()
@@ -356,6 +411,10 @@ func (tc *MonitoringTestCtx) waitForOperatorUpgrade(t *testing.T, report *olmUpg
 			"approve pending InstallPlan for subscription %s/%s", namespace, name)
 		snap, err := tc.operatorOLMSnapshot(namespace, name)
 		g.Expect(err).NotTo(HaveOccurred(), "failed to read subscription %s/%s during upgrade", namespace, name)
+		lastSnap = snap
+		if msg := staleOperatorCSVFailure(snap); msg != "" {
+			g.Expect(msg).To(BeEmpty(), "%s", msg)
+		}
 		g.Expect(snap.InstalledCSV).NotTo(BeEmpty(), "subscription %s/%s should have installed CSV", namespace, name)
 		if previousCSV != "" {
 			g.Expect(snap.InstalledCSV).NotTo(Equal(previousCSV),
@@ -383,36 +442,58 @@ func (tc *MonitoringTestCtx) assertMonitoringOperandsWithoutBlockingFinalizers(t
 	}
 	cleanupTimeout := 10 * time.Minute
 	for _, resource := range resources {
-		nn := types.NamespacedName{Name: resource.name, Namespace: resource.namespace}
-		failureMsg := fmt.Sprintf("%s %s did not finish deletion cleanup within %s after OLM upgrade",
-			resource.gvk.Kind, resource.name, cleanupTimeout)
-		tc.g.Eventually(func() error {
-			obj, err := tc.fetchResource(t, resource.gvk, nn)
-			if err != nil {
-				if k8serr.IsNotFound(err) {
-					return nil
-				}
-				return err
-			}
-			if obj.GetDeletionTimestamp() == nil {
+		tc.waitForOperandDeletionCleanupAfterUpgrade(t, report, resource.gvk, resource.name, resource.namespace, cleanupTimeout)
+	}
+}
+
+func (tc *MonitoringTestCtx) waitForOperandDeletionCleanupAfterUpgrade(
+	t *testing.T,
+	report *olmUpgradeSurvivabilityReport,
+	resourceGVK schema.GroupVersionKind,
+	name, namespace string,
+	cleanupTimeout time.Duration,
+) {
+	t.Helper()
+	tc = tc.WithT(t)
+	nn := types.NamespacedName{Name: name, Namespace: namespace}
+	failureMsg := fmt.Sprintf("%s %s did not finish deletion cleanup within %s after OLM upgrade",
+		resourceGVK.Kind, name, cleanupTimeout)
+	defer func() {
+		if t.Failed() && report.FailedAssertion == "" {
+			report.FailedAssertion = failureMsg
+		}
+	}()
+	tc.g.Eventually(func() error {
+		obj, err := tc.fetchResource(t, resourceGVK, nn)
+		if err != nil {
+			if k8serr.IsNotFound(err) {
 				return nil
 			}
-			if finalizers := obj.GetFinalizers(); len(finalizers) > 0 {
-				return fmt.Errorf("%s %s is still deleting with finalizers %v", resource.gvk.Kind, resource.name, finalizers)
-			}
+			return err
+		}
+		if obj.GetDeletionTimestamp() == nil {
 			return nil
-		}).WithTimeout(cleanupTimeout).WithPolling(15*time.Second).Should(Succeed(), failureMsg)
-	}
+		}
+		if finalizers := obj.GetFinalizers(); len(finalizers) > 0 {
+			return fmt.Errorf("%s %s is still deleting with finalizers %v", resourceGVK.Kind, name, finalizers)
+		}
+		return nil
+	}).WithTimeout(cleanupTimeout).WithPolling(15*time.Second).Should(Succeed(), failureMsg)
 }
 
 func (tc *MonitoringTestCtx) assertMonitoringUpgradeHealthContract(t *testing.T, report *olmUpgradeSurvivabilityReport) {
 	t.Helper()
 	tc = tc.WithT(t)
 
+	monitoringFailureMsg := "Monitoring should be Ready with metrics stack, Thanos, and Perses available after OLM upgrade"
 	compat := &cooCompatibilityReport{}
 	defer func() {
 		if compat.FailedAssertion != "" {
 			report.FailedAssertion = compat.FailedAssertion
+			return
+		}
+		if t.Failed() && report.FailedAssertion == "" {
+			report.FailedAssertion = monitoringFailureMsg
 		}
 	}()
 
@@ -425,7 +506,7 @@ func (tc *MonitoringTestCtx) assertMonitoringUpgradeHealthContract(t *testing.T,
 			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionThanosQuerierAvailable, metav1.ConditionTrue),
 		)),
 		WithEventuallyTimeout(20*time.Minute),
-		WithCustomErrorMsg("Monitoring should be Ready with metrics stack, Thanos, and Perses available after OLM upgrade"),
+		WithCustomErrorMsg(monitoringFailureMsg),
 	)
 
 	tc.validatePersesOperandHealth(t, compat)

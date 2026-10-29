@@ -73,6 +73,37 @@ func TestSubscriptionInstallPlanApprovalIsManual(t *testing.T) {
 	}
 }
 
+func TestOperatorCSVNamePrefix(t *testing.T) {
+	if got := operatorCSVNamePrefix(tempoOpName); got != "tempo-operator." {
+		t.Fatalf("tempo subscription prefix: got %q", got)
+	}
+	if got := operatorCSVNamePrefix(observabilityOpName); got != observabilityOpName+"." {
+		t.Fatalf("COO subscription prefix: got %q", got)
+	}
+}
+
+func TestStaleOperatorCSVFailure(t *testing.T) {
+	snap := operatorOLMSnapshot{
+		SubscriptionNamespace: "openshift-tempo-operator",
+		SubscriptionName:      tempoOpName,
+		InstalledCSV:          "tempo-operator.v1.2.3",
+		CSVPhase:              "Succeeded",
+		OperatorCSVs: []operatorCSVPhase{
+			{Name: "tempo-operator.v1.2.3", Phase: "Succeeded"},
+			{Name: "tempo-operator.v1.2.2", Phase: "Replacing"},
+		},
+	}
+	if msg := staleOperatorCSVFailure(snap); msg == "" {
+		t.Fatal("expected stale Replacing CSV to be reported")
+	}
+
+	healthy := snap
+	healthy.OperatorCSVs = []operatorCSVPhase{{Name: healthy.InstalledCSV, Phase: "Succeeded"}}
+	if msg := staleOperatorCSVFailure(healthy); msg != "" {
+		t.Fatalf("expected no stale failure, got %q", msg)
+	}
+}
+
 func TestSubscriptionInstalledCSV(t *testing.T) {
 	sub := &unstructured.Unstructured{Object: map[string]any{
 		"status": map[string]any{"installedCSV": "a"},

@@ -24,15 +24,21 @@ var csvPhasesStuck = []string{
 
 // operatorOLMSnapshot captures subscription and CSV state for upgrade diagnostics.
 type operatorOLMSnapshot struct {
-	SubscriptionNamespace string `json:"subscriptionNamespace,omitempty"`
-	SubscriptionName      string `json:"subscriptionName,omitempty"`
-	Channel               string `json:"channel,omitempty"`
-	StartingCSV           string `json:"startingCSV,omitempty"`
-	InstallPlanRef        string `json:"installPlanRef,omitempty"`
-	InstalledCSV          string `json:"installedCSV,omitempty"`
-	CurrentCSV            string `json:"currentCSV,omitempty"`
-	CSVPhase              string `json:"csvPhase,omitempty"`
-	CSVVersion            string `json:"csvVersion,omitempty"`
+	SubscriptionNamespace string             `json:"subscriptionNamespace,omitempty"`
+	SubscriptionName      string             `json:"subscriptionName,omitempty"`
+	Channel               string             `json:"channel,omitempty"`
+	StartingCSV           string             `json:"startingCSV,omitempty"`
+	InstallPlanRef        string             `json:"installPlanRef,omitempty"`
+	InstalledCSV          string             `json:"installedCSV,omitempty"`
+	CurrentCSV            string             `json:"currentCSV,omitempty"`
+	CSVPhase              string             `json:"csvPhase,omitempty"`
+	CSVVersion            string             `json:"csvVersion,omitempty"`
+	OperatorCSVs          []operatorCSVPhase `json:"operatorCSVs,omitempty"`
+}
+
+type operatorCSVPhase struct {
+	Name  string `json:"name,omitempty"`
+	Phase string `json:"phase,omitempty"`
 }
 
 func parseUpgradeOperators(raw string) ([]string, error) {
@@ -92,6 +98,9 @@ func csvPhaseIndicatesStuckLifecycle(phase string) bool {
 
 func firstOLMLifecycleFailure(snapshots []operatorOLMSnapshot) string {
 	for _, snap := range snapshots {
+		if msg := staleOperatorCSVFailure(snap); msg != "" {
+			return msg
+		}
 		if snap.InstalledCSV == "" {
 			return fmt.Sprintf(
 				"subscription %s/%s has no installed CSV (installPlanRef=%s)",
@@ -103,6 +112,38 @@ func firstOLMLifecycleFailure(snapshots []operatorOLMSnapshot) string {
 				"CSV %s/%s phase is %q (subscription %s/%s channel=%s startingCSV=%s)",
 				snap.SubscriptionNamespace, snap.InstalledCSV, snap.CSVPhase,
 				snap.SubscriptionNamespace, snap.SubscriptionName, snap.Channel, snap.StartingCSV,
+			)
+		}
+	}
+	return ""
+}
+
+func operatorCSVNamePrefix(subscriptionName string) string {
+	switch strings.TrimSpace(subscriptionName) {
+	case tempoOpName:
+		return "tempo-operator."
+	default:
+		return strings.TrimSpace(subscriptionName) + "."
+	}
+}
+
+func staleOperatorCSVFailure(snap operatorOLMSnapshot) string {
+	for _, csv := range snap.OperatorCSVs {
+		if csv.Name == snap.InstalledCSV && csvPhaseIsHealthy(csv.Phase) {
+			continue
+		}
+		if csvPhaseIndicatesStuckLifecycle(csv.Phase) {
+			return fmt.Sprintf(
+				"stale operator CSV %s/%s phase is %q (subscription %s/%s installedCSV=%s)",
+				snap.SubscriptionNamespace, csv.Name, csv.Phase,
+				snap.SubscriptionNamespace, snap.SubscriptionName, snap.InstalledCSV,
+			)
+		}
+		if !csvPhaseIsHealthy(csv.Phase) {
+			return fmt.Sprintf(
+				"operator CSV %s/%s phase is %q (subscription %s/%s installedCSV=%s)",
+				snap.SubscriptionNamespace, csv.Name, csv.Phase,
+				snap.SubscriptionNamespace, snap.SubscriptionName, snap.InstalledCSV,
 			)
 		}
 	}
