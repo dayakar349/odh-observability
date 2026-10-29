@@ -94,6 +94,39 @@ func TestOperatorUpgradeTargetCSV(t *testing.T) {
 	}
 }
 
+func TestInstallPlanTargetsExpectedOrIntermediate(t *testing.T) {
+	snap := operatorOLMSnapshot{
+		SubscriptionName:      tempoOpName,
+		InstallPlanTargetCSVs: []string{"tempo-operator.v0.22.0-3"},
+	}
+	if !installPlanTargetsExpectedOrIntermediate(snap, "tempo-operator.v0.22.0-2", "tempo-operator.v0.22.0-4") {
+		t.Fatal("expected an intermediate Tempo CSV to be accepted")
+	}
+	if installPlanTargetsExpectedOrIntermediate(snap, "tempo-operator.v0.22.0-3", "tempo-operator.v0.22.0-4") {
+		t.Fatal("the currently installed CSV must not be accepted as progress")
+	}
+	snap.InstallPlanTargetCSVs = []string{"tempo-operator.v0.22.0-4"}
+	if !installPlanTargetsExpectedOrIntermediate(snap, "tempo-operator.v0.22.0-3", "tempo-operator.v0.22.0-4") {
+		t.Fatal("expected the final target CSV to be accepted")
+	}
+}
+
+func TestPackageManifestChannelCurrentCSV(t *testing.T) {
+	manifest := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"name": "tempo-product"},
+		"status": map[string]any{"channels": []any{
+			map[string]any{"name": "stable", "currentCSV": "tempo-operator.v0.22.0-4"},
+		}},
+	}}
+	got, err := packageManifestChannelCurrentCSV(manifest, "stable")
+	if err != nil || got != "tempo-operator.v0.22.0-4" {
+		t.Fatalf("unexpected target CSV %q, err=%v", got, err)
+	}
+	if _, err := packageManifestChannelCurrentCSV(manifest, "missing"); err == nil {
+		t.Fatal("expected missing channel to fail")
+	}
+}
+
 func TestTempoTracePayload(t *testing.T) {
 	const traceID = "0123456789abcdef0123456789abcdef"
 	const spanID = "0123456789abcdef"

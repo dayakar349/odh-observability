@@ -988,7 +988,7 @@ func (tc *MonitoringTestCtx) ensurePrerequisitesWithMonitoringReset(t *testing.T
 	// Operator metrics use monitoring.rhobs/v1 (gvk.ServiceMonitor), which COO
 	// installs. ServiceMonitorCoreos above is the webhook target and a different CRD.
 	// Create the operator ServiceMonitor in Module mode only.
-	if tc.ApiMode == APIModeModule {
+	if tc.ApiMode == APIModeModule && resetMonitoring {
 		tc.ensureOperatorServiceMonitor(t)
 	}
 

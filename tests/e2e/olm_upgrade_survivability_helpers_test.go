@@ -206,6 +206,15 @@ func installPlanTargetsOperatorUpgrade(snap operatorOLMSnapshot, previousCSV str
 	return operatorUpgradeTargetCSV(snap, previousCSV) != ""
 }
 
+func installPlanTargetsExpectedOrIntermediate(
+	snap operatorOLMSnapshot, installedCSV, expectedTargetCSV string,
+) bool {
+	if slices.Contains(snap.InstallPlanTargetCSVs, expectedTargetCSV) {
+		return true
+	}
+	return installPlanTargetsOperatorUpgrade(snap, installedCSV)
+}
+
 func operatorUpgradeTargetCSV(snap operatorOLMSnapshot, previousCSV string) string {
 	prefix := operatorCSVNamePrefix(snap.SubscriptionName)
 	for _, csvName := range snap.InstallPlanTargetCSVs {

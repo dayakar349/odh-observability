@@ -3,6 +3,7 @@ package e2e_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -337,31 +338,92 @@ func (tc *MonitoringTestCtx) runConfiguredOperatorUpgrades(t *testing.T, report 
 			tc.failUpgradeAssertion(t, report, fmt.Sprintf("failed to read pre-upgrade OLM state for %s: %v", operator, err))
 		}
 		transition.SourceCSV = before.InstalledCSV
-
-		if stringsEqualFoldTrim(before.Channel, targetChannel) && before.InstalledCSV != "" {
-			transition.TargetCSV = before.InstalledCSV
+		expectedTargetCSV, err := tc.subscriptionChannelCurrentCSV(ns, name, targetChannel)
+		if err != nil {
+			tc.failUpgradeAssertion(t, report, fmt.Sprintf(
+				"failed to resolve target CSV for %s channel %s: %v", operator, targetChannel, err))
+		}
+		transition.TargetCSV = expectedTargetCSV
+		if before.InstalledCSV == expectedTargetCSV {
+			if !stringsEqualFoldTrim(before.Channel, targetChannel) {
+				tc.failUpgradeAssertion(t, report, fmt.Sprintf(
+					"cannot test %s upgrade: target channel %s resolves to already-installed CSV %s",
+					operator, targetChannel, expectedTargetCSV))
+			}
 			transition.Skipped = true
-			transition.SkipReason = "subscription already on target channel with installed CSV"
+			transition.SkipReason = "operator already uses target-channel CSV"
 			report.OperatorTransitions = append(report.OperatorTransitions, transition)
-			t.Logf("skipping %s upgrade: already on channel %s with CSV %s", operator, targetChannel, before.InstalledCSV)
+			t.Logf("skipping %s upgrade: already using target CSV %s", operator, expectedTargetCSV)
 			continue
 		}
+		requireNewInstallPlan := !stringsEqualFoldTrim(before.Channel, targetChannel)
 
 		if err := tc.patchSubscriptionChannel(types.NamespacedName{Namespace: ns, Name: name}, targetChannel); err != nil {
 			tc.failUpgradeAssertion(t, report, fmt.Sprintf("failed to patch %s subscription to target channel %s: %v", operator, targetChannel, err))
 		}
 		t.Logf("patched Subscription %s/%s to channel %s", ns, name, targetChannel)
-		tc.waitForOperatorUpgrade(t, report, ns, name, targetChannel, before.InstalledCSV, before.InstallPlanRef)
+		tc.waitForOperatorUpgrade(
+			t, report, ns, name, targetChannel, expectedTargetCSV,
+			before.InstalledCSV, before.InstallPlanRef, requireNewInstallPlan,
+		)
 		after, err := tc.operatorOLMSnapshot(ns, name)
 		if err != nil {
 			tc.failUpgradeAssertion(t, report, fmt.Sprintf("failed to read post-upgrade OLM state for %s: %v", operator, err))
 		}
-		transition.TargetCSV = after.InstalledCSV
 		report.OperatorTransitions = append(report.OperatorTransitions, transition)
 
 		tc.assertOLMSnapshotsHealthy(t, report, []operatorOLMSnapshot{after})
 		tc.assertMonitoringOperandsWithoutBlockingFinalizers(t, report)
 	}
+}
+
+func (tc *MonitoringTestCtx) subscriptionChannelCurrentCSV(namespace, name, targetChannel string) (string, error) {
+	sub, err := tc.fetchResource(tc.t, gvk.Subscription, types.NamespacedName{Namespace: namespace, Name: name})
+	if err != nil {
+		return "", fmt.Errorf("read subscription: %w", err)
+	}
+	packageName, _, _ := unstructured.NestedString(sub.Object, "spec", "name")
+	source, _, _ := unstructured.NestedString(sub.Object, "spec", "source")
+	sourceNamespace, _, _ := unstructured.NestedString(sub.Object, "spec", "sourceNamespace")
+	if packageName == "" || source == "" || sourceNamespace == "" {
+		return "", errors.New("subscription is missing package, catalog source, or source namespace")
+	}
+
+	manifests := &unstructured.UnstructuredList{}
+	manifests.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "packages.operators.coreos.com", Version: "v1", Kind: "PackageManifestList",
+	})
+	if err := tc.client.List(tc.ctx, manifests,
+		client.InNamespace(sourceNamespace), client.MatchingLabels{"catalog": source}); err != nil {
+		return "", fmt.Errorf("list PackageManifests for catalog %s/%s: %w", sourceNamespace, source, err)
+	}
+	for _, manifest := range manifests.Items {
+		if manifest.GetName() != packageName {
+			continue
+		}
+		return packageManifestChannelCurrentCSV(&manifest, targetChannel)
+	}
+	return "", fmt.Errorf("PackageManifest %s not found for catalog %s/%s", packageName, sourceNamespace, source)
+}
+
+func packageManifestChannelCurrentCSV(manifest *unstructured.Unstructured, targetChannel string) (string, error) {
+	channels, _, _ := unstructured.NestedSlice(manifest.Object, "status", "channels")
+	for _, raw := range channels {
+		channel, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		channelName, _, _ := unstructured.NestedString(channel, "name")
+		if channelName != targetChannel {
+			continue
+		}
+		currentCSV, _, _ := unstructured.NestedString(channel, "currentCSV")
+		if currentCSV == "" {
+			return "", fmt.Errorf("PackageManifest %s channel %s has no currentCSV", manifest.GetName(), targetChannel)
+		}
+		return currentCSV, nil
+	}
+	return "", fmt.Errorf("PackageManifest %s has no channel %s", manifest.GetName(), targetChannel)
 }
 
 func stringsEqualFoldTrim(a, b string) bool {
@@ -397,7 +459,8 @@ func (tc *MonitoringTestCtx) patchSubscriptionChannel(nn types.NamespacedName, c
 }
 
 func (tc *MonitoringTestCtx) approvePendingInstallPlanForSubscription(
-	t *testing.T, subscriptionNamespace, subscriptionName, targetChannel, previousCSV, previousInstallPlan string,
+	t *testing.T, subscriptionNamespace, subscriptionName, targetChannel, expectedTargetCSV, previousInstallPlan string,
+	requireNewInstallPlan bool,
 ) error {
 	t.Helper()
 	sub, err := tc.fetchResource(tc.t, gvk.Subscription, types.NamespacedName{
@@ -418,7 +481,7 @@ func (tc *MonitoringTestCtx) approvePendingInstallPlanForSubscription(
 	if !found || installPlanName == "" {
 		return fmt.Errorf("subscription has no InstallPlan resolved for target channel %q", targetChannel)
 	}
-	if previousInstallPlan != "" && installPlanName == previousInstallPlan {
+	if requireNewInstallPlan && previousInstallPlan != "" && installPlanName == previousInstallPlan {
 		return fmt.Errorf("subscription still references pre-upgrade InstallPlan %s", previousInstallPlan)
 	}
 	installPlanNamespace, _, _ := unstructured.NestedString(sub.Object, "status", "installPlanRef", "namespace")
@@ -431,13 +494,11 @@ func (tc *MonitoringTestCtx) approvePendingInstallPlanForSubscription(
 		return fmt.Errorf("read InstallPlan %s: %w", ipNN, err)
 	}
 	targetCSVs, _, _ := unstructured.NestedStringSlice(ip.Object, "spec", "clusterServiceVersionNames")
-	planSnap := operatorOLMSnapshot{
-		SubscriptionName:      subscriptionName,
-		InstallPlanTargetCSVs: targetCSVs,
-	}
-	if !installPlanTargetsOperatorUpgrade(planSnap, previousCSV) {
-		return fmt.Errorf("InstallPlan %s targets %v, waiting for a %s upgrade from %s",
-			ipNN, targetCSVs, subscriptionName, previousCSV)
+	installedCSV := subscriptionInstalledCSV(sub)
+	planSnap := operatorOLMSnapshot{SubscriptionName: subscriptionName, InstallPlanTargetCSVs: targetCSVs}
+	if !installPlanTargetsExpectedOrIntermediate(planSnap, installedCSV, expectedTargetCSV) {
+		return fmt.Errorf("InstallPlan %s targets %v, waiting for an operator upgrade from %s toward target-channel CSV %s",
+			ipNN, targetCSVs, installedCSV, expectedTargetCSV)
 	}
 	approved, found, _ := unstructured.NestedBool(ip.Object, "spec", "approved")
 	if found && approved {
@@ -457,7 +518,8 @@ func (tc *MonitoringTestCtx) approvePendingInstallPlanForSubscription(
 
 func (tc *MonitoringTestCtx) waitForOperatorUpgrade(
 	t *testing.T, report *olmUpgradeSurvivabilityReport,
-	namespace, name, targetChannel, previousCSV, previousInstallPlan string,
+	namespace, name, targetChannel, expectedTargetCSV, previousCSV, previousInstallPlan string,
+	requireNewInstallPlan bool,
 ) {
 	t.Helper()
 	timeout := tc.Timeouts.olmOperationTimeout
@@ -482,15 +544,14 @@ func (tc *MonitoringTestCtx) waitForOperatorUpgrade(
 			"subscription %s/%s should remain on target channel", namespace, name)
 		g.Expect(snap.InstallPlanRef).NotTo(BeEmpty(),
 			"subscription %s/%s should resolve an InstallPlan for the target channel", namespace, name)
-		if previousInstallPlan != "" {
+		if requireNewInstallPlan && previousInstallPlan != "" {
 			g.Expect(snap.InstallPlanRef).NotTo(Equal(previousInstallPlan),
 				"subscription %s/%s should stop referencing pre-upgrade InstallPlan %s", namespace, name, previousInstallPlan)
 		}
-		targetCSV := operatorUpgradeTargetCSV(snap, previousCSV)
-		g.Expect(targetCSV).NotTo(BeEmpty(),
-			"subscription %s/%s should reference an InstallPlan for the target operator upgrade", namespace, name)
+		g.Expect(installPlanTargetsExpectedOrIntermediate(snap, snap.InstalledCSV, expectedTargetCSV)).To(BeTrue(),
+			"subscription %s/%s should reference an InstallPlan advancing toward target-channel CSV %s", namespace, name, expectedTargetCSV)
 		g.Expect(tc.approvePendingInstallPlanForSubscription(
-			t, namespace, name, targetChannel, previousCSV, previousInstallPlan,
+			t, namespace, name, targetChannel, expectedTargetCSV, previousInstallPlan, requireNewInstallPlan,
 		)).To(Succeed(),
 			"approve target InstallPlan for subscription %s/%s", namespace, name)
 		if msg := staleOperatorCSVFailure(snap); msg != "" {
@@ -501,8 +562,8 @@ func (tc *MonitoringTestCtx) waitForOperatorUpgrade(
 			g.Expect(snap.InstalledCSV).NotTo(Equal(previousCSV),
 				"subscription %s/%s should advance from CSV %s", namespace, name, previousCSV)
 		}
-		g.Expect(snap.InstalledCSV).To(Equal(targetCSV),
-			"subscription %s/%s should converge on the CSV resolved by its target InstallPlan", namespace, name)
+		g.Expect(snap.InstalledCSV).To(Equal(expectedTargetCSV),
+			"subscription %s/%s should converge on target-channel CSV %s", namespace, name, expectedTargetCSV)
 		g.Expect(csvPhaseIndicatesStuckLifecycle(snap.CSVPhase)).To(BeFalse(),
 			"CSV %s should not be stuck in phase %q", snap.InstalledCSV, snap.CSVPhase)
 		g.Expect(snap.CSVPhase).To(Equal("Succeeded"), "CSV %s phase", snap.InstalledCSV)

@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
@@ -796,7 +797,7 @@ cat /tmp/body`, url)
 	t.Cleanup(func() {
 		tc.DeleteResource(WithMinimalObject(gvk.Pod, nn), WithIgnoreNotFound(true))
 	})
-	tc.createFixtureResource(t, gvk.Pod, &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: observabilityOpNamespace,
@@ -813,17 +814,33 @@ cat /tmp/body`, url)
 				SecurityContext: fixtureContainerSecurityContext(),
 			}},
 		},
+	}
+	if err := tc.Client().Create(tc.Context(), pod); err != nil {
+		return "", 0, fmt.Errorf("create Perses API probe pod: %w", err)
+	}
+
+	var phase corev1.PodPhase
+	err := wait.PollUntilContextTimeout(tc.Context(), 2*time.Second, 3*time.Minute, true, func(ctx context.Context) (bool, error) {
+		current := &corev1.Pod{}
+		if err := tc.Client().Get(ctx, nn, current); err != nil {
+			if k8serr.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		phase = current.Status.Phase
+		return phase == corev1.PodSucceeded || phase == corev1.PodFailed, nil
 	})
-	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.Pod, nn),
-		WithCondition(jq.Match(`.status.phase == "Succeeded"`)),
-		WithEventuallyTimeout(3*time.Minute),
-		WithCustomErrorMsg("Perses API probe pod should complete successfully"),
-	)
+	if err != nil {
+		return "", 0, fmt.Errorf("wait for Perses API probe pod (last phase %q): %w", phase, err)
+	}
 
 	logs, err := tc.podLogTail(nn, "probe", 1000)
 	if err != nil {
-		return "", 0, err
+		return "", 0, fmt.Errorf("read Perses API probe logs after phase %q: %w", phase, err)
+	}
+	if phase != corev1.PodSucceeded {
+		return "", 0, fmt.Errorf("Perses API probe pod failed: %s", logs)
 	}
 	return parseHTTPProbeLog(logs)
 }
