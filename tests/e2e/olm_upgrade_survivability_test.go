@@ -1,6 +1,7 @@
 package e2e_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -14,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
@@ -80,32 +82,32 @@ func olmUpgradeSurvivabilitySuite(t *testing.T) {
 		}
 	}()
 
-	mctx.ensurePrerequisites(t)
-	mctx.setupMetrics(t)
+	mctx.ensurePrerequisitesPreservingMonitoring(t)
 
-	t.Run("Record pre-upgrade baseline", func(t *testing.T) {
-		report.Baseline = mctx.captureUpgradeHealthSnapshot(t, report)
-		mctx.assertOLMSnapshotsHealthy(t, report, report.Baseline.OLM)
-	})
-	if t.Failed() {
-		return
+	// Keep the baseline, upgrade, and post-upgrade assertions in one test body.
+	// Separate subtests can be independently selected with -run and would allow
+	// the post-upgrade contract to pass without executing an upgrade.
+	t.Log("recording and validating pre-upgrade baseline")
+	report.Baseline = mctx.captureUpgradeHealthSnapshot(t, report)
+	mctx.assertOLMSnapshotsHealthy(t, report, report.Baseline.OLM)
+	mctx.assertMonitoringHealthContract(t, report, "before OLM upgrade")
+	if slices.Contains(operators, upgradeOperatorTempo) {
+		mctx.assertTempoTraceHealth(t, report, "before OLM upgrade")
 	}
 
-	t.Run("Exercise OLM upgrades", func(t *testing.T) {
-		mctx.runConfiguredOperatorUpgrades(t, report, operators)
-		if !upgradeTransitionsIncludePerformedUpgrade(report.OperatorTransitions) {
-			mctx.failUpgradeAssertion(t, report, "no operator upgrade was performed; target channels must differ from the current subscription channel")
-		}
-	})
-	if t.Failed() {
-		return
+	t.Log("executing configured OLM upgrades")
+	mctx.runConfiguredOperatorUpgrades(t, report, operators)
+	if !upgradeTransitionsIncludePerformedUpgrade(report.OperatorTransitions) {
+		mctx.failUpgradeAssertion(t, report, "no operator upgrade was performed; target channels must differ from the current subscription channel")
 	}
 
-	t.Run("Post-upgrade monitoring health contract", func(t *testing.T) {
-		report.PostUpgrade = mctx.captureUpgradeHealthSnapshot(t, report)
-		mctx.assertOLMSnapshotsHealthy(t, report, report.PostUpgrade.OLM)
-		mctx.assertMonitoringUpgradeHealthContract(t, report)
-	})
+	t.Log("capturing and validating post-upgrade state")
+	report.PostUpgrade = mctx.captureUpgradeHealthSnapshot(t, report)
+	mctx.assertOLMSnapshotsHealthy(t, report, report.PostUpgrade.OLM)
+	mctx.assertMonitoringHealthContract(t, report, "after OLM upgrade")
+	if slices.Contains(operators, upgradeOperatorTempo) {
+		mctx.assertTempoTraceHealth(t, report, "after OLM upgrade")
+	}
 
 	if !t.Failed() {
 		mctx.writeUpgradeSurvivabilityReport(t, report)
@@ -208,6 +210,33 @@ func (tc *MonitoringTestCtx) operatorOLMSnapshot(namespace, name string) (operat
 	snap.CurrentCSV, _, _ = unstructured.NestedString(sub.Object, "status", "currentCSV")
 	installPlanName, _, _ := unstructured.NestedString(sub.Object, "status", "installPlanRef", "name")
 	snap.InstallPlanRef = installPlanName
+	snap.InstallPlanNamespace, _, _ = unstructured.NestedString(sub.Object, "status", "installPlanRef", "namespace")
+	if snap.InstallPlanNamespace == "" {
+		snap.InstallPlanNamespace = namespace
+	}
+	if installPlanName != "" {
+		ip, installPlanErr := tc.fetchResource(tc.t, gvk.InstallPlan, types.NamespacedName{
+			Name: installPlanName, Namespace: snap.InstallPlanNamespace,
+		})
+		if installPlanErr != nil {
+			snap.InstallPlanReadError = installPlanErr.Error()
+		} else {
+			snap.InstallPlanPhase, _, _ = unstructured.NestedString(ip.Object, "status", "phase")
+			snap.InstallPlanApproved, _, _ = unstructured.NestedBool(ip.Object, "spec", "approved")
+			snap.InstallPlanTargetCSVs, _, _ = unstructured.NestedStringSlice(ip.Object, "spec", "clusterServiceVersionNames")
+			conditions, _, _ := unstructured.NestedSlice(ip.Object, "status", "conditions")
+			for _, rawCondition := range conditions {
+				condition, ok := rawCondition.(map[string]any)
+				if !ok {
+					continue
+				}
+				snap.InstallPlanConditions = append(snap.InstallPlanConditions, operatorInstallPlanCondition{
+					Type: installPlanConditionString(condition, "type"), Message: installPlanConditionString(condition, "message"),
+					Reason: installPlanConditionString(condition, "reason"), Status: installPlanConditionString(condition, "status"),
+				})
+			}
+		}
+	}
 
 	if snap.InstalledCSV == "" {
 		return snap, nil
@@ -227,6 +256,11 @@ func (tc *MonitoringTestCtx) operatorOLMSnapshot(namespace, name string) (operat
 		return snap, err
 	}
 	return snap, nil
+}
+
+func installPlanConditionString(condition map[string]any, key string) string {
+	value, _ := condition[key].(string)
+	return value
 }
 
 func (tc *MonitoringTestCtx) listOperatorCSVPhases(namespace, subscriptionName string) ([]operatorCSVPhase, error) {
@@ -313,8 +347,11 @@ func (tc *MonitoringTestCtx) runConfiguredOperatorUpgrades(t *testing.T, report 
 			continue
 		}
 
-		tc.patchSubscriptionChannel(t, types.NamespacedName{Namespace: ns, Name: name}, targetChannel)
-		tc.waitForOperatorUpgrade(t, report, ns, name, before.InstalledCSV)
+		if err := tc.patchSubscriptionChannel(types.NamespacedName{Namespace: ns, Name: name}, targetChannel); err != nil {
+			tc.failUpgradeAssertion(t, report, fmt.Sprintf("failed to patch %s subscription to target channel %s: %v", operator, targetChannel, err))
+		}
+		t.Logf("patched Subscription %s/%s to channel %s", ns, name, targetChannel)
+		tc.waitForOperatorUpgrade(t, report, ns, name, targetChannel, before.InstalledCSV, before.InstallPlanRef)
 		after, err := tc.operatorOLMSnapshot(ns, name)
 		if err != nil {
 			tc.failUpgradeAssertion(t, report, fmt.Sprintf("failed to read post-upgrade OLM state for %s: %v", operator, err))
@@ -331,25 +368,37 @@ func stringsEqualFoldTrim(a, b string) bool {
 	return strings.TrimSpace(strings.ToLower(a)) == strings.TrimSpace(strings.ToLower(b))
 }
 
-func (tc *MonitoringTestCtx) patchSubscriptionChannel(t *testing.T, nn types.NamespacedName, channel string) {
-	t.Helper()
+func (tc *MonitoringTestCtx) patchSubscriptionChannel(nn types.NamespacedName, channel string) error {
 	patch, err := json.Marshal(map[string]any{"spec": map[string]any{"channel": channel}})
 	if err != nil {
-		t.Fatalf("failed to build subscription patch: %v", err)
+		return fmt.Errorf("build subscription patch: %w", err)
 	}
-	tc.g.Eventually(func() error {
+	var lastErr error
+	err = wait.PollUntilContextTimeout(tc.ctx, 2*time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
 		sub := &unstructured.Unstructured{}
 		sub.SetGroupVersionKind(gvk.Subscription)
-		if err := tc.client.Get(tc.ctx, nn, sub); err != nil {
-			return err
+		if err := tc.client.Get(ctx, nn, sub); err != nil {
+			lastErr = err
+			return false, nil //nolint:nilerr // retry transient API failures until the bounded timeout
 		}
-		return tc.client.Patch(tc.ctx, sub, client.RawPatch(types.MergePatchType, patch))
-	}).WithTimeout(2*time.Minute).WithPolling(2*time.Second).Should(Succeed(),
-		"failed to patch Subscription %s channel to %s", nn, channel)
-	t.Logf("patched Subscription %s/%s to channel %s", nn.Namespace, nn.Name, channel)
+		if err := tc.client.Patch(ctx, sub, client.RawPatch(types.MergePatchType, patch)); err != nil {
+			lastErr = err
+			return false, nil //nolint:nilerr // retry conflicts and transient API failures
+		}
+		return true, nil
+	})
+	if err != nil {
+		if lastErr != nil {
+			return fmt.Errorf("patch Subscription %s/%s channel to %s: %w", nn.Namespace, nn.Name, channel, lastErr)
+		}
+		return fmt.Errorf("patch Subscription %s/%s channel to %s: %w", nn.Namespace, nn.Name, channel, err)
+	}
+	return nil
 }
 
-func (tc *MonitoringTestCtx) approvePendingInstallPlanForSubscription(t *testing.T, subscriptionNamespace, subscriptionName string) error {
+func (tc *MonitoringTestCtx) approvePendingInstallPlanForSubscription(
+	t *testing.T, subscriptionNamespace, subscriptionName, targetChannel, previousCSV, previousInstallPlan string,
+) error {
 	t.Helper()
 	sub, err := tc.fetchResource(tc.t, gvk.Subscription, types.NamespacedName{
 		Namespace: subscriptionNamespace,
@@ -361,9 +410,16 @@ func (tc *MonitoringTestCtx) approvePendingInstallPlanForSubscription(t *testing
 	if !subscriptionInstallPlanApprovalIsManual(sub) {
 		return nil
 	}
+	channel, _, _ := unstructured.NestedString(sub.Object, "spec", "channel")
+	if !stringsEqualFoldTrim(channel, targetChannel) {
+		return fmt.Errorf("subscription channel is %q, waiting for target channel %q", channel, targetChannel)
+	}
 	installPlanName, found, _ := unstructured.NestedString(sub.Object, "status", "installPlanRef", "name")
 	if !found || installPlanName == "" {
-		return nil
+		return fmt.Errorf("subscription has no InstallPlan resolved for target channel %q", targetChannel)
+	}
+	if previousInstallPlan != "" && installPlanName == previousInstallPlan {
+		return fmt.Errorf("subscription still references pre-upgrade InstallPlan %s", previousInstallPlan)
 	}
 	installPlanNamespace, _, _ := unstructured.NestedString(sub.Object, "status", "installPlanRef", "namespace")
 	if installPlanNamespace == "" {
@@ -373,6 +429,15 @@ func (tc *MonitoringTestCtx) approvePendingInstallPlanForSubscription(t *testing
 	ip, err := tc.fetchResource(tc.t, gvk.InstallPlan, ipNN)
 	if err != nil {
 		return fmt.Errorf("read InstallPlan %s: %w", ipNN, err)
+	}
+	targetCSVs, _, _ := unstructured.NestedStringSlice(ip.Object, "spec", "clusterServiceVersionNames")
+	planSnap := operatorOLMSnapshot{
+		SubscriptionName:      subscriptionName,
+		InstallPlanTargetCSVs: targetCSVs,
+	}
+	if !installPlanTargetsOperatorUpgrade(planSnap, previousCSV) {
+		return fmt.Errorf("InstallPlan %s targets %v, waiting for a %s upgrade from %s",
+			ipNN, targetCSVs, subscriptionName, previousCSV)
 	}
 	approved, found, _ := unstructured.NestedBool(ip.Object, "spec", "approved")
 	if found && approved {
@@ -390,7 +455,10 @@ func (tc *MonitoringTestCtx) approvePendingInstallPlanForSubscription(t *testing
 	return nil
 }
 
-func (tc *MonitoringTestCtx) waitForOperatorUpgrade(t *testing.T, report *olmUpgradeSurvivabilityReport, namespace, name, previousCSV string) {
+func (tc *MonitoringTestCtx) waitForOperatorUpgrade(
+	t *testing.T, report *olmUpgradeSurvivabilityReport,
+	namespace, name, targetChannel, previousCSV, previousInstallPlan string,
+) {
 	t.Helper()
 	timeout := tc.Timeouts.olmOperationTimeout
 	failureMsg := fmt.Sprintf("operator %s/%s did not converge after OLM upgrade within %s", namespace, name, timeout)
@@ -407,11 +475,24 @@ func (tc *MonitoringTestCtx) waitForOperatorUpgrade(t *testing.T, report *olmUpg
 		}
 	}()
 	tc.g.Eventually(func(g Gomega) {
-		g.Expect(tc.approvePendingInstallPlanForSubscription(t, namespace, name)).To(Succeed(),
-			"approve pending InstallPlan for subscription %s/%s", namespace, name)
 		snap, err := tc.operatorOLMSnapshot(namespace, name)
 		g.Expect(err).NotTo(HaveOccurred(), "failed to read subscription %s/%s during upgrade", namespace, name)
 		lastSnap = snap
+		g.Expect(snap.Channel).To(Equal(targetChannel),
+			"subscription %s/%s should remain on target channel", namespace, name)
+		g.Expect(snap.InstallPlanRef).NotTo(BeEmpty(),
+			"subscription %s/%s should resolve an InstallPlan for the target channel", namespace, name)
+		if previousInstallPlan != "" {
+			g.Expect(snap.InstallPlanRef).NotTo(Equal(previousInstallPlan),
+				"subscription %s/%s should stop referencing pre-upgrade InstallPlan %s", namespace, name, previousInstallPlan)
+		}
+		targetCSV := operatorUpgradeTargetCSV(snap, previousCSV)
+		g.Expect(targetCSV).NotTo(BeEmpty(),
+			"subscription %s/%s should reference an InstallPlan for the target operator upgrade", namespace, name)
+		g.Expect(tc.approvePendingInstallPlanForSubscription(
+			t, namespace, name, targetChannel, previousCSV, previousInstallPlan,
+		)).To(Succeed(),
+			"approve target InstallPlan for subscription %s/%s", namespace, name)
 		if msg := staleOperatorCSVFailure(snap); msg != "" {
 			g.Expect(msg).To(BeEmpty(), "%s", msg)
 		}
@@ -420,6 +501,8 @@ func (tc *MonitoringTestCtx) waitForOperatorUpgrade(t *testing.T, report *olmUpg
 			g.Expect(snap.InstalledCSV).NotTo(Equal(previousCSV),
 				"subscription %s/%s should advance from CSV %s", namespace, name, previousCSV)
 		}
+		g.Expect(snap.InstalledCSV).To(Equal(targetCSV),
+			"subscription %s/%s should converge on the CSV resolved by its target InstallPlan", namespace, name)
 		g.Expect(csvPhaseIndicatesStuckLifecycle(snap.CSVPhase)).To(BeFalse(),
 			"CSV %s should not be stuck in phase %q", snap.InstalledCSV, snap.CSVPhase)
 		g.Expect(snap.CSVPhase).To(Equal("Succeeded"), "CSV %s phase", snap.InstalledCSV)
@@ -481,11 +564,15 @@ func (tc *MonitoringTestCtx) waitForOperandDeletionCleanupAfterUpgrade(
 	}).WithTimeout(cleanupTimeout).WithPolling(15*time.Second).Should(Succeed(), failureMsg)
 }
 
-func (tc *MonitoringTestCtx) assertMonitoringUpgradeHealthContract(t *testing.T, report *olmUpgradeSurvivabilityReport) {
+func (tc *MonitoringTestCtx) assertMonitoringHealthContract(
+	t *testing.T, report *olmUpgradeSurvivabilityReport, stage string,
+) {
 	t.Helper()
 	tc = tc.WithT(t)
 
-	monitoringFailureMsg := "Monitoring should be Ready with metrics stack, Thanos, and Perses available after OLM upgrade"
+	monitoringFailureMsg := fmt.Sprintf(
+		"Monitoring should be Ready with metrics stack, Thanos, and Perses available %s", stage,
+	)
 	compat := &cooCompatibilityReport{}
 	defer func() {
 		if compat.FailedAssertion != "" {

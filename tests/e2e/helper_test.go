@@ -912,6 +912,19 @@ func (tc *MonitoringTestCtx) registerMonitoringRestore(t *testing.T) {
 // is auto-detected from the CR's spec.namespace unless overridden via flag.
 func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 	t.Helper()
+	tc.ensurePrerequisitesWithMonitoringReset(t, true)
+}
+
+// ensurePrerequisitesPreservingMonitoring validates the live monitoring stack
+// without rewriting its configuration. Upgrade survivability depends on the
+// same operands remaining available across the operator transition.
+func (tc *MonitoringTestCtx) ensurePrerequisitesPreservingMonitoring(t *testing.T) {
+	t.Helper()
+	tc.ensurePrerequisitesWithMonitoringReset(t, false)
+}
+
+func (tc *MonitoringTestCtx) ensurePrerequisitesWithMonitoringReset(t *testing.T, resetMonitoring bool) {
+	t.Helper()
 
 	operatorMonitoringNamespace := tc.ensureOperatorDeploymentReady(t)
 	if tc.ApiMode == APIModeModule && tc.MonitoringNamespace == "" {
@@ -931,7 +944,9 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 	if tc.ApiMode == APIModeDSC {
 		tc.ensureCRDExists(t, gvk.DSCInitialization)
 	}
-	tc.registerMonitoringRestore(t)
+	if resetMonitoring {
+		tc.registerMonitoringRestore(t)
+	}
 
 	if testOpts.installOperators {
 		tc.installDependentOperators(t)
@@ -977,15 +992,35 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 		tc.ensureOperatorServiceMonitor(t)
 	}
 
-	tc.ensureMonitoringCRExists(t)
+	if resetMonitoring {
+		tc.ensureMonitoringCRExists(t)
+	} else {
+		if tc.ApiMode == APIModeDSC {
+			tc.EnsureResourceExists(
+				WithMinimalObject(gvk.DSCInitialization, types.NamespacedName{Name: tc.DSCICRName}),
+				WithCustomErrorMsg("upgrade survivability requires an existing DSCI"),
+			)
+		}
+		tc.EnsureResourceExists(
+			WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+			WithCustomErrorMsg("upgrade survivability requires an existing Monitoring CR"),
+		)
+	}
 
 	if tc.MonitoringNamespace == "" {
 		tc.MonitoringNamespace = tc.detectMonitoringNamespace(t)
 		t.Logf("auto-detected monitoring namespace: %s", tc.MonitoringNamespace)
 	}
 
-	tc.ensureNamespaceExists(tc.MonitoringNamespace)
-	tc.resetMonitoringConfigToManaged()
+	if resetMonitoring {
+		tc.ensureNamespaceExists(tc.MonitoringNamespace)
+		tc.resetMonitoringConfigToManaged()
+	} else {
+		tc.EnsureResourceExists(
+			WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: tc.MonitoringNamespace}),
+			WithCustomErrorMsg("active monitoring namespace %s must already exist", tc.MonitoringNamespace),
+		)
+	}
 }
 
 // operatorExists checks the OLM OperatorCondition API version served by the

@@ -92,6 +92,9 @@ func (c *TestContextConfig) validate() error {
 		}
 	}
 	if c.upgradeEnabled {
+		if c.installOperators {
+			return errors.New("upgrade-enabled requires -install-operators=false; upgrade operators and operands must exist before the baseline")
+		}
 		operators, err := parseUpgradeOperators(c.upgradeOperators)
 		if err != nil {
 			return fmt.Errorf("invalid upgrade-operators: %w", err)

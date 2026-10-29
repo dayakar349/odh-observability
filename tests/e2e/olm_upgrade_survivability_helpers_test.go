@@ -24,16 +24,29 @@ var csvPhasesStuck = []string{
 
 // operatorOLMSnapshot captures subscription and CSV state for upgrade diagnostics.
 type operatorOLMSnapshot struct {
-	SubscriptionNamespace string             `json:"subscriptionNamespace,omitempty"`
-	SubscriptionName      string             `json:"subscriptionName,omitempty"`
-	Channel               string             `json:"channel,omitempty"`
-	StartingCSV           string             `json:"startingCSV,omitempty"`
-	InstallPlanRef        string             `json:"installPlanRef,omitempty"`
-	InstalledCSV          string             `json:"installedCSV,omitempty"`
-	CurrentCSV            string             `json:"currentCSV,omitempty"`
-	CSVPhase              string             `json:"csvPhase,omitempty"`
-	CSVVersion            string             `json:"csvVersion,omitempty"`
-	OperatorCSVs          []operatorCSVPhase `json:"operatorCSVs,omitempty"`
+	SubscriptionNamespace string                         `json:"subscriptionNamespace,omitempty"`
+	SubscriptionName      string                         `json:"subscriptionName,omitempty"`
+	Channel               string                         `json:"channel,omitempty"`
+	StartingCSV           string                         `json:"startingCSV,omitempty"`
+	InstallPlanRef        string                         `json:"installPlanRef,omitempty"`
+	InstallPlanNamespace  string                         `json:"installPlanNamespace,omitempty"`
+	InstallPlanPhase      string                         `json:"installPlanPhase,omitempty"`
+	InstallPlanApproved   bool                           `json:"installPlanApproved,omitempty"`
+	InstallPlanTargetCSVs []string                       `json:"installPlanTargetCSVs,omitempty"`
+	InstallPlanConditions []operatorInstallPlanCondition `json:"installPlanConditions,omitempty"`
+	InstallPlanReadError  string                         `json:"installPlanReadError,omitempty"`
+	InstalledCSV          string                         `json:"installedCSV,omitempty"`
+	CurrentCSV            string                         `json:"currentCSV,omitempty"`
+	CSVPhase              string                         `json:"csvPhase,omitempty"`
+	CSVVersion            string                         `json:"csvVersion,omitempty"`
+	OperatorCSVs          []operatorCSVPhase             `json:"operatorCSVs,omitempty"`
+}
+
+type operatorInstallPlanCondition struct {
+	Type    string `json:"type,omitempty"`
+	Status  string `json:"status,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 type operatorCSVPhase struct {
@@ -187,4 +200,18 @@ func subscriptionInstallPlanApprovalIsManual(sub *unstructured.Unstructured) boo
 	}
 	approval, _, _ := unstructured.NestedString(sub.Object, "spec", "installPlanApproval")
 	return strings.EqualFold(strings.TrimSpace(approval), "Manual")
+}
+
+func installPlanTargetsOperatorUpgrade(snap operatorOLMSnapshot, previousCSV string) bool {
+	return operatorUpgradeTargetCSV(snap, previousCSV) != ""
+}
+
+func operatorUpgradeTargetCSV(snap operatorOLMSnapshot, previousCSV string) string {
+	prefix := operatorCSVNamePrefix(snap.SubscriptionName)
+	for _, csvName := range snap.InstallPlanTargetCSVs {
+		if strings.HasPrefix(csvName, prefix) && csvName != previousCSV {
+			return csvName
+		}
+	}
+	return ""
 }

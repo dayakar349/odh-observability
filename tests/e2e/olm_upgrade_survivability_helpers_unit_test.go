@@ -1,6 +1,8 @@
 package e2e_test
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -70,6 +72,52 @@ func TestSubscriptionInstallPlanApprovalIsManual(t *testing.T) {
 		"spec": map[string]any{"installPlanApproval": "Manual"},
 	}}) {
 		t.Fatal("expected Manual approval policy")
+	}
+}
+
+func TestOperatorUpgradeTargetCSV(t *testing.T) {
+	snap := operatorOLMSnapshot{
+		SubscriptionName: tempoOpName,
+		InstallPlanTargetCSVs: []string{
+			"dependency.v1.0.0",
+			"tempo-operator.v0.22.0-4",
+		},
+	}
+	if got := operatorUpgradeTargetCSV(snap, "tempo-operator.v0.22.0-3"); got != "tempo-operator.v0.22.0-4" {
+		t.Fatalf("unexpected target CSV %q", got)
+	}
+	if !installPlanTargetsOperatorUpgrade(snap, "tempo-operator.v0.22.0-3") {
+		t.Fatal("expected InstallPlan to target a Tempo upgrade")
+	}
+	if got := operatorUpgradeTargetCSV(snap, "tempo-operator.v0.22.0-4"); got != "" {
+		t.Fatalf("current CSV must not be treated as an upgrade target, got %q", got)
+	}
+}
+
+func TestTempoTracePayload(t *testing.T) {
+	const traceID = "0123456789abcdef0123456789abcdef"
+	const spanID = "0123456789abcdef"
+	payload := tempoTracePayload(traceID, spanID, 100, 200)
+	if !json.Valid([]byte(payload)) {
+		t.Fatalf("Tempo trace payload is not valid JSON: %s", payload)
+	}
+	for _, expected := range []string{traceID, spanID, `"startTimeUnixNano":"100"`, `"endTimeUnixNano":"200"`} {
+		if !strings.Contains(payload, expected) {
+			t.Fatalf("Tempo trace payload does not contain %q: %s", expected, payload)
+		}
+	}
+}
+
+func TestUpgradeConfigRejectsOperatorInstallation(t *testing.T) {
+	c := TestContextConfig{
+		apiMode:           APIModeDSC,
+		installOperators:  true,
+		upgradeEnabled:    true,
+		upgradeOperators:  upgradeOperatorCOO,
+		upgradeCOOChannel: "stable",
+	}
+	if err := c.validate(); err == nil || !strings.Contains(err.Error(), "requires -install-operators=false") {
+		t.Fatalf("expected upgrade configuration to reject operator installation, got %v", err)
 	}
 }
 
