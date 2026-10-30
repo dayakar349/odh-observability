@@ -28,6 +28,7 @@ import (
 	libconditions "github.com/opendatahub-io/odh-platform-utilities/pkg/controller/conditions"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/controller/gc"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
+	odhAnnotations "github.com/opendatahub-io/odh-platform-utilities/pkg/metadata/annotations"
 	odhLabels "github.com/opendatahub-io/odh-platform-utilities/pkg/metadata/labels"
 	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
 	configv1 "github.com/openshift/api/config/v1"
@@ -99,6 +100,42 @@ const (
 // resources predating componentLabel.
 var lokiComponents = []string{componentLokiUsageLogs, componentLokiLogs}
 
+//nolint:goconst // Resource names intentionally mirror the rendered RBAC templates.
+var scopedClusterRoleNames = map[string]struct{}{
+	"data-science-collector-mlflow-trace-export": {},
+	"data-science-collector-tempo-trace-export":  {},
+	"data-science-metrics-view":                  {},
+	"data-science-usage-logs-processor":          {},
+	"generate-processors-role":                   {},
+	"generate-processors-targetallocator-role":   {},
+	"korrel8r-query":                             {},
+	"usage-logs-processor":                       {},
+}
+
+//nolint:goconst // Resource names intentionally mirror the rendered RBAC templates.
+var scopedClusterRoleBindingNames = map[string]struct{}{
+	"data-science-cluster-log-forwarder-collector-collect-app-logs":       {},
+	"data-science-cluster-log-forwarder-collector-loki-writer":            {},
+	"data-science-collector-mlflow-trace-export":                          {},
+	"data-science-collector-tempo-trace-export":                           {},
+	"data-science-monitoringstack-alertmanager-prometheus-metrics-reader": {},
+	"data-science-prometheus-cluster-proxy":                               {},
+	"data-science-prometheus-cluster-proxy-auth-delegator":                {},
+	"data-science-prometheus-namespace-proxy":                             {},
+	"data-science-prometheus-namespace-proxy-auth-delegator":              {},
+	"data-science-thanos-querier-proxy":                                   {},
+	"data-science-thanos-querier-proxy-auth-delegator":                    {},
+	"data-science-usage-logs-processor":                                   {},
+	"generate-processors-collector-rolebinding":                           {},
+	"generate-processors-targetallocator-discovery-rolebinding":           {},
+	"generate-processors-targetallocator-rolebinding":                     {},
+	"korrel8r-auth-delegator":                                             {},
+	"korrel8r-query":                                                      {},
+	"usage-logs-processor":                                                {},
+	"usage-logs-loki-writer":                                              {},
+	"data-science-usage-logs-loki-writer":                                 {},
+}
+
 func operatorVersion() string {
 	return os.Getenv("OPERATOR_VERSION")
 }
@@ -125,7 +162,12 @@ type MonitoringReconciler struct {
 // +kubebuilder:rbac:groups=opentelemetry.io,resources=opentelemetrycollectors;instrumentations,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=perses.dev,resources=perses;persesdatasources;persesdashboards,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings;clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings;clusterroles;clusterrolebindings,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,resourceNames=data-science-collector-targetallocator-secrets,verbs=update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames=data-science-collector-mlflow-trace-export;data-science-collector-tempo-trace-export;data-science-metrics-view;data-science-usage-logs-processor;generate-processors-role;generate-processors-targetallocator-role;korrel8r-query,verbs=update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,resourceNames=data-science-cluster-log-forwarder-collector-collect-app-logs;data-science-cluster-log-forwarder-collector-loki-writer;data-science-collector-mlflow-trace-export;data-science-collector-tempo-trace-export;data-science-monitoringstack-alertmanager-prometheus-metrics-reader;data-science-prometheus-cluster-proxy;data-science-prometheus-cluster-proxy-auth-delegator;data-science-prometheus-namespace-proxy;data-science-prometheus-namespace-proxy-auth-delegator;data-science-thanos-querier-proxy;data-science-thanos-querier-proxy-auth-delegator;data-science-usage-logs-processor;generate-processors-collector-rolebinding;generate-processors-targetallocator-discovery-rolebinding;generate-processors-targetallocator-rolebinding;korrel8r-auth-delegator;korrel8r-query,verbs=update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames=usage-logs-processor,verbs=delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,resourceNames=usage-logs-processor;usage-logs-loki-writer;data-science-usage-logs-loki-writer,verbs=delete
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=podmonitors;servicemonitors,verbs=*
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=scrapeconfigs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch
@@ -728,7 +770,11 @@ func (r *MonitoringReconciler) collectGarbage(
 		return err
 	}
 
-	return r.collectTargetAllocatorRBACGarbage(ctx, params, desiredSet, namespace)
+	if err := r.collectScopedClusterRBACGarbage(ctx, monitoring, desiredSet, withheldComponents); err != nil {
+		return err
+	}
+
+	return r.collectTargetAllocatorRBACGarbage(ctx, monitoring, desiredSet)
 }
 
 // deleteAllOwned removes all resources owned by this controller (used on Removed state).
@@ -756,30 +802,144 @@ func (r *MonitoringReconciler) deleteAllOwned(ctx context.Context, monitoring *v
 		return err
 	}
 
-	return r.collectTargetAllocatorRBACGarbage(ctx, params, nil, namespace)
+	if err := r.collectScopedClusterRBACGarbage(ctx, monitoring, nil, nil); err != nil {
+		return err
+	}
+
+	return r.collectTargetAllocatorRBACGarbage(ctx, monitoring, nil)
+}
+
+func (r *MonitoringReconciler) collectScopedClusterRBACGarbage(
+	ctx context.Context,
+	monitoring *v1alpha1.Monitoring,
+	desiredSet map[resourceKey]struct{},
+	withheldComponents map[string]struct{},
+) error {
+	roles := &rbacv1.ClusterRoleList{}
+	if err := r.List(ctx, roles, client.MatchingLabels{
+		odhLabels.PlatformPartOf: monitoringPartOf,
+	}); err != nil {
+		return fmt.Errorf("listing scoped ClusterRoles: %w", err)
+	}
+	for i := range roles.Items {
+		role := &roles.Items[i]
+		if !shouldCollectScopedClusterRBAC(
+			monitoring, controllergvk.ClusterRole, role, scopedClusterRoleNames, desiredSet, withheldComponents,
+		) {
+			continue
+		}
+		if err := r.Delete(ctx, role, scopedRBACDeleteOptions(role)); err != nil && !k8serr.IsNotFound(err) {
+			return fmt.Errorf("deleting scoped ClusterRole %s: %w", role.Name, err)
+		}
+	}
+
+	bindings := &rbacv1.ClusterRoleBindingList{}
+	if err := r.List(ctx, bindings, client.MatchingLabels{
+		odhLabels.PlatformPartOf: monitoringPartOf,
+	}); err != nil {
+		return fmt.Errorf("listing scoped ClusterRoleBindings: %w", err)
+	}
+	for i := range bindings.Items {
+		binding := &bindings.Items[i]
+		if !shouldCollectScopedClusterRBAC(
+			monitoring, controllergvk.ClusterRoleBinding, binding, scopedClusterRoleBindingNames, desiredSet, withheldComponents,
+		) {
+			continue
+		}
+		if err := r.Delete(ctx, binding, scopedRBACDeleteOptions(binding)); err != nil && !k8serr.IsNotFound(err) {
+			return fmt.Errorf("deleting scoped ClusterRoleBinding %s: %w", binding.Name, err)
+		}
+	}
+
+	return nil
+}
+
+func scopedRBACDeleteOptions(obj metav1.Object) *client.DeleteOptions {
+	uid := obj.GetUID()
+	resourceVersion := obj.GetResourceVersion()
+	return &client.DeleteOptions{
+		Preconditions: &metav1.Preconditions{
+			UID:             &uid,
+			ResourceVersion: &resourceVersion,
+		},
+	}
+}
+
+func shouldCollectScopedClusterRBAC(
+	monitoring *v1alpha1.Monitoring,
+	gvk schema.GroupVersionKind,
+	obj metav1.Object,
+	allowedNames map[string]struct{},
+	desiredSet map[resourceKey]struct{},
+	withheldComponents map[string]struct{},
+) bool {
+	if _, allowed := allowedNames[obj.GetName()]; !allowed {
+		return false
+	}
+	if !isOwnedByMonitoring(monitoring, obj) {
+		return false
+	}
+	if isNotManagedByODHOperator(obj) {
+		return false
+	}
+	if _, isWithheld := withheldComponents[obj.GetLabels()[componentLabel]]; isWithheld {
+		return false
+	}
+
+	key := resourceKey{gvk: gvk, name: obj.GetName()}
+	_, desired := desiredSet[key]
+	return !desired
 }
 
 func (r *MonitoringReconciler) collectTargetAllocatorRBACGarbage(
 	ctx context.Context,
-	params gc.RunParams,
+	monitoring *v1alpha1.Monitoring,
 	desiredSet map[resourceKey]struct{},
-	namespace string,
 ) error {
-	collector := gc.New(
-		gc.WithLabel(odhLabels.PlatformPartOf, monitoringPartOf),
-		// Role and RoleBinding listing remains cluster-wide, but the
-		// SelfSubjectRulesReview used by the collector requires a namespace.
-		gc.InNamespace(namespace),
-		gc.WithDeletePropagationPolicy(metav1.DeletePropagationBackground),
-		gc.WithTypePredicate(func(_ gc.RunParams, gvk schema.GroupVersionKind) (bool, error) {
-			return gvk == controllergvk.Role || gvk == controllergvk.RoleBinding, nil
-		}),
-		gc.WithObjectPredicate(func(_ gc.RunParams, obj unstructured.Unstructured) (bool, error) {
-			return shouldCollectTargetAllocatorRBAC(params.Owner, obj, desiredSet), nil
-		}),
-	)
+	roles := &rbacv1.RoleList{}
+	if err := r.List(ctx, roles, client.MatchingLabels{
+		odhLabels.PlatformPartOf: monitoringPartOf,
+	}); err != nil {
+		return fmt.Errorf("listing TargetAllocator Roles: %w", err)
+	}
+	for i := range roles.Items {
+		role := &roles.Items[i]
+		if !shouldCollectTargetAllocatorRBAC(
+			monitoring, role, controllergvk.Role, desiredSet,
+		) {
+			continue
+		}
+		if err := r.Delete(ctx, role,
+			scopedRBACDeleteOptions(role),
+			client.PropagationPolicy(metav1.DeletePropagationBackground),
+		); err != nil && !k8serr.IsNotFound(err) {
+			return fmt.Errorf("deleting TargetAllocator Role %s/%s: %w", role.Namespace, role.Name, err)
+		}
+	}
 
-	return collector.Run(ctx, params)
+	bindings := &rbacv1.RoleBindingList{}
+	if err := r.List(ctx, bindings, client.MatchingLabels{
+		odhLabels.PlatformPartOf: monitoringPartOf,
+	}); err != nil {
+		return fmt.Errorf("listing TargetAllocator RoleBindings: %w", err)
+	}
+	for i := range bindings.Items {
+		binding := &bindings.Items[i]
+		if !shouldCollectTargetAllocatorRBAC(
+			monitoring, binding, controllergvk.RoleBinding, desiredSet,
+		) {
+			continue
+		}
+		if err := r.Delete(ctx, binding,
+			scopedRBACDeleteOptions(binding),
+			client.PropagationPolicy(metav1.DeletePropagationBackground),
+		); err != nil && !k8serr.IsNotFound(err) {
+			return fmt.Errorf("deleting TargetAllocator RoleBinding %s/%s: %w",
+				binding.Namespace, binding.Name, err)
+		}
+	}
+
+	return nil
 }
 
 func shouldCollectOwnedResource(
@@ -829,20 +989,28 @@ func shouldCollectOwnedResource(
 
 func shouldCollectTargetAllocatorRBAC(
 	monitoring client.Object,
-	obj unstructured.Unstructured,
+	obj metav1.Object,
+	gvk schema.GroupVersionKind,
 	desiredSet map[resourceKey]struct{},
 ) bool {
-	if !isTargetAllocatorSecretRBAC(obj) || !isOwnedByMonitoring(monitoring, &obj) {
+	if !isTargetAllocatorSecretRBAC(obj, gvk) || !isOwnedByMonitoring(monitoring, obj) {
+		return false
+	}
+	if isNotManagedByODHOperator(obj) {
 		return false
 	}
 
 	k := resourceKey{
-		gvk:       obj.GroupVersionKind(),
+		gvk:       gvk,
 		namespace: obj.GetNamespace(),
 		name:      obj.GetName(),
 	}
 	_, inDesired := desiredSet[k]
 	return !inDesired
+}
+
+func isNotManagedByODHOperator(obj metav1.Object) bool {
+	return obj.GetAnnotations()[odhAnnotations.ManagedByODHOperator] == "false"
 }
 
 func isOwnedByMonitoring(monitoring client.Object, obj metav1.Object) bool {
@@ -857,9 +1025,9 @@ func isInMonitoringScope(obj metav1.Object, namespace string) bool {
 	return obj.GetNamespace() == "" || obj.GetNamespace() == namespace || obj.GetNamespace() == clusterLoggingNamespace
 }
 
-func isTargetAllocatorSecretRBAC(obj unstructured.Unstructured) bool {
+func isTargetAllocatorSecretRBAC(obj metav1.Object, gvk schema.GroupVersionKind) bool {
 	return obj.GetName() == targetAllocatorSecretRBACName &&
-		(obj.GroupVersionKind() == controllergvk.Role || obj.GroupVersionKind() == controllergvk.RoleBinding)
+		(gvk == controllergvk.Role || gvk == controllergvk.RoleBinding)
 }
 
 // patchStatus uses MergePatch to update the status subresource.
